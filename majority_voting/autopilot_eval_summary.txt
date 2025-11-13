@@ -1,0 +1,1661 @@
+CANDIDATE FITNESS FUNCTIONS (EASY: 1 episode values, HARD: 3-episode lists per metric):
+
+=== Fitness Function 000 ===
+source_preview:
+def fitness_function():
+    """
+    Computes a scalar fitness ∈ [0, 1] and a dictionary of sub-metrics
+    for a CARLA driving episode, emphasizing:
+      - Safety (no collisions, reasonable braking)
+      - Efficiency (progress and speed tracking toward 25 km/h)
+      - Smoothness (low jerk, smooth steering)
+      - Rule compliance (no red-light violations, no overspeeding)
+    Assumes this function is called at the end of run_episode() and can
+    access `self` (the environment object) and other helpers (e.g., project_point_onto_loop).
+    Only uses built-in libraries: math and numpy.
+    """
+    import math
+    import numpy as np
+
+    metrics = {}
+
+    # ----------------------------- basic constants and inputs -----------------------------
+    desired_speed_kmh = 25.0  # target cruising speed
+    overspeed_margin_kmh = 10.0  # overspeed threshold above desired
+    stop_thresh_kmh = 1.0  # consider "stopped" if below this
+
+    # timestep (try to read CARLA fixed delta; fallback to 20Hz)
+    try:
+        settings = self.world.get_settings()
+        dt = float(settings.fixed_delta_seconds) if getattr(settings, "fixed_delta_seconds", None) else 0.05
+    except Exception:
+        dt = 0.05
+
+    speeds_kmh = np.array(getattr(self, "speeds_kmh", []), dtype=np.float32)
+    N = int(speeds_kmh.size)
+    steps = int(getattr(self, "total_steps", N))
+    max_steps = int(getattr(self, "max_steps", max(steps, 1)))
+    total_time_s = float(steps * dt)
+
+    # ----------------------------- progress along loop -----------------------------
+    # Progress fraction (0..1) using the final position on the loop
+    progress_frac = 0.0
+    try:
+        if getattr(self, "positions", None) and len(self.positions) > 0:
+            last_xy = np.array(self.positions[-1], dtype=np.float32)
+            s_now, *_ = project_point_onto_loop(last_xy, self.A, self.AB, self.seg_len, self.s_before)
+            prog_m = wrap_forward_progress(s_now, self.s0, self.L)
+            progress_frac = float(prog_m / max(self.L, 1e-6))
+            progress_frac = max(0.0, min(1.0, progress_frac))
+    except Exception:
+        progress_frac = 0.0
+
+    # ----------------------------- speed/acc/jerk and smoothness -----------------------------
+    if N > 0:
+        avg_speed_kmh = float(np.mean(speeds_kmh))
+        mae_speed_kmh = float(np.mean(np.abs(speeds_kmh - desired_speed_kmh)))
+        overspeed_thresh = desired_speed_kmh + overspeed_margin_kmh
+        overspeed_frac = float(np.mean(speeds_kmh > overspeed_thresh))
+        stop_frac = float(np.mean(speeds_kmh < stop_thresh_kmh))
+    else:
+        avg_speed_kmh = 0.0
+        mae_speed_kmh = desired_speed_kmh
+        overspeed_frac = 0.0
+        stop_frac = 1.0
+
+    # Convert to m/s for dynamics
+    speeds_mps = speeds_kmh / 3.6 if N > 0 else np.zeros(0, dtype=np.float32)
+
+    # Acceleration and jerk (finite differences)
+    if (N >= 3) and (dt > 1e-6):
+        acc = np.diff(speeds_mps) / dt                     # m/s^2
+        jerk = np.diff(acc) / dt                           # m/s^3
+        abs_jerk = np.abs(jerk)
+        jerk95 = float(np.percentile(abs_jerk, 95)) if abs_jerk.size > 0 else 0.0
+
+        neg_acc = -acc[acc < 0] if acc.size > 0 else np.zeros(0)
+        decel95 = float(np.percentile(neg_acc, 95)) if neg_acc.size > 0 else 0.0
+
+        # Steering rate
+        steer_arr = np.array(getattr(self, "steerings", []), dtype=np.float32)
+        if steer_arr.size >= 3:
+            st_rate = np.diff(steer_arr) / dt
+            st_rate95 = float(np.percentile(np.abs(st_rate), 95))
+        else:
+            st_rate95 = 0.0
+    else:
+        acc = np.zeros(0, dtype=np.float32)
+        jerk = np.zeros(0, dtype=np.float32)
+        jerk95 = 0.0
+        decel95 = 0.0
+        st_rate95 = 0.0
+
+    # ----------------------------- per-aspect scores in [0,1] -----------------------------
+    # Efficiency: combine progress and speed tracking; add penalty for excessive idling
+    # - speed tracking score: 1 at 0 km/h error, 0 at 20
+--- end_source_preview ---
+EASY:
+  episode_file: ep_000.json
+  fitness: 0.201863
+  metrics: avg_speed_kmh:12.826, brake_decel95_mps2:2.475031, collided:0, desired_speed_kmh:25, done_path:1, dt_s:0.05, fitness_total:0.201863, jerk95_mps3:43.715691, mae_speed_kmh:12.229274, max_steps:8000, overspeed_frac:0, progress_frac:0, red_light_violations:0, score_efficiency:0.084531, score_rule_compliance:1, score_safety:1, score_smoothness:0.000628, steering_rate95_per_s:0.525905, steps:3291, stop_ratio:0.456092, total_time_s:164.55
+HARD:
+  episodes: 3
+  episode_files: [ep_000.json, ep_001.json, ep_002.json]
+  fitness_per_episode: [0, 0, 0]
+  metrics_per_episode:
+    avg_speed_kmh: [22.453665, 22.471815, 22.443069]
+    brake_decel95_mps2: [2.125554, 2.157085, 2.159833]
+    collided: [1, 1, 1]
+    desired_speed_kmh: [25, 25, 25]
+    done_path: [0, 0, 0]
+    dt_s: [0.05, 0.05, 0.05]
+    fitness_total: [0, 0, 0]
+    jerk95_mps3: [42.49926, 43.94524, 46.574986]
+    mae_speed_kmh: [2.66044, 2.646903, 2.677203]
+    max_steps: [8000, 8000, 8000]
+    overspeed_frac: [0, 0, 0]
+    progress_frac: [0, 0, 0]
+    red_light_violations: [0, 0, 0]
+    score_efficiency: [0.330206, 0.330606, 0.329814]
+    score_rule_compliance: [1, 1, 1]
+    score_safety: [0, 0, 0]
+    score_smoothness: [0.000839, 0.000659, 0.000425]
+    steering_rate95_per_s: [0.001083, 0.001009, 0.001011]
+    steps: [230, 232, 229]
+    stop_ratio: [0.047826, 0.047414, 0.048035]
+    total_time_s: [11.5, 11.6, 11.45]
+
+=== Fitness Function 001 ===
+source_preview:
+def fitness_score():
+    """
+    Computes a scalar fitness in [0, 1] and a dictionary of interpretable sub-metrics
+    for the just-finished episode, using data logged during run_episode.
+
+    Assumptions and goals:
+    - Safety first: any collision yields 0 fitness (hard fail).
+    - Efficiency: complete the loop and make forward progress while maintaining ~25 km/h.
+    - Smoothness: avoid high per-step changes in steering and speed (approximate accel).
+    - Rule compliance: avoid red-light violations; avoid prolonged overspeed.
+
+    Inputs (read from the environment; must be in scope when called):
+      self.positions        : list of (x, y) tuples
+      self.speeds_kmh       : list of ego speeds [km/h]
+      self.steerings        : list of steering commands in [-1, 1]
+      self.total_steps      : number of steps executed
+      self.max_steps        : max allowed steps
+      self.done_path        : whether the loop was completed (True/False)
+      self.num_red_violations : integer count of red-light violations
+      self.collision_flag   : dict with key "flag" True if collision occurred
+      self.collision_ids    : set/list of actor IDs the ego collided with
+      self.A, self.AB, self.seg_len, self.s_before : path geometry (for projection)
+      self.s0, self.L       : initial curvilinear s and loop length for progress
+
+    Returns:
+      total_fitness (float in [0,1]), metrics (dict of sub-metrics)
+    """
+    import math
+    import numpy as np
+
+    # -------------------------
+    # Constants / preferences
+    # -------------------------
+    DESIRED_SPD_KMH = 25.0
+    OVERSPD_MARGIN_KMH = 5.0
+    OVERSPD_THRESH_KMH = DESIRED_SPD_KMH + OVERSPD_MARGIN_KMH
+
+    # Smoothness normalization caps (per-step changes; tuned to be reasonable for typical CARLA ticks)
+    # These caps map "good" behavior to scores near 1 and clamp worse behavior down towards 0.
+    CAP_STEER_RATE = 0.08     # mean |Δsteer| per step; 0.08 ≈ mild steering changes step-to-step
+    CAP_DV_MPS     = 0.12     # mean |Δv| per step in m/s; ~0.1 m/s per step is gentle accel/decel
+
+    # -------------------------
+    # Gather and sanitize logs
+    # -------------------------
+    speeds_kmh = np.array(self.speeds_kmh, dtype=np.float32) if self.speeds_kmh else np.zeros((0,), dtype=np.float32)
+    steer      = np.array(self.steerings,  dtype=np.float32) if self.steerings  else np.zeros((0,), dtype=np.float32)
+    pos_arr    = np.array(self.positions,  dtype=np.float32) if self.positions  else np.zeros((0,2), dtype=np.float32)
+
+    n_steps = int(self.total_steps) if hasattr(self, "total_steps") else (len(speeds_kmh) if len(speeds_kmh) > 0 else 0)
+    max_steps = int(self.max_steps) if hasattr(self, "max_steps") else max(1, n_steps)
+
+    collided = bool(self.collision_flag.get("flag", False)) if hasattr(self, "collision_flag") else False
+    num_red = int(getattr(self, "num_red_violations", 0))
+
+    # -------------------------
+    # Safety gate (hard fail)
+    # -------------------------
+    # If a collision happened at any time, return zero fitness.
+    if collided:
+        metrics = {
+            "collided": True,
+            "collisions_count": len(getattr(self, "collision_ids", [])),
+            "red_light_violations": num_red,
+            "avg_speed_kmh": float(np.mean(speeds_kmh)) if speeds_kmh.size > 0 else 0.0,
+            "progress_frac": 0.0,
+            "path_completed": bool(getattr(self, "done_path", False)),
+            "overspeed_frac": 0.0,
+            "stop_frac": 0.0,
+            "speed_mae_to_25_kmh": float(np.mean(np.abs(speeds_kmh - DESIRED_SPD_KMH))) if speeds_kmh.size > 0 else DESIRED_SPD_KMH,
+            "steer_rate_abs_mean": float(np.mean(np.abs(np.diff(steer)))) if steer.size >= 2 else 0.0,
+            "dv_abs_mean_mps_per_step": 0.0,
+            "time_efficiency": 0.0,
+            "efficiency_score": 0.0,
+            "smoothness_score": 0.0,
+            "rule_compliance_score": 0.0,
+        }
+        return 0.0, metrics
+
+    # ---------
+--- end_source_preview ---
+EASY:
+  episode_file: ep_000.json
+  fitness: 0.854528
+  metrics: avg_speed_kmh:11.787499, collided:0, collisions_count:0, dv_abs_mean_mps_per_step:0.046097, efficiency_score:0.796083, fitness:0.854528, overspeed_frac:0, path_completed:1, progress_frac:1, red_light_violations:0, rule_compliance_score:1, smoothness_score:0.782431, speed_mae_to_25_kmh:13.261819, steer_rate_abs_mean:0.00408, stop_frac:0.5, time_efficiency:0.55225
+HARD:
+  episodes: 3
+  episode_files: [ep_000.json, ep_001.json, ep_002.json]
+  fitness_per_episode: [0, 0, 0]
+  metrics_per_episode:
+    avg_speed_kmh: [22.514524, 22.443232, 14.730138]
+    collided: [1, 1, 1]
+    collisions_count: [1, 1, 1]
+    dv_abs_mean_mps_per_step: [0, 0, 0]
+    efficiency_score: [0, 0, 0]
+    overspeed_frac: [0, 0, 0]
+    path_completed: [0, 0, 0]
+    progress_frac: [0, 0, 0]
+    red_light_violations: [0, 0, 0]
+    rule_compliance_score: [0, 0, 0]
+    smoothness_score: [0, 0, 0]
+    speed_mae_to_25_kmh: [2.605708, 2.677042, 10.333003]
+    steer_rate_abs_mean: [0.000023, 0.000025, 0.003858]
+    stop_frac: [0, 0, 0]
+    time_efficiency: [0, 0, 0]
+
+=== Fitness Function 002 ===
+source_preview:
+def fitness_function():
+    """
+    Fitness function for a CARLA driving episode.
+    Reads variables available in run_episode() scope via `self`:
+      - self.positions: list of (x, y) tuples along the trajectory
+      - self.steerings: list of steering commands per step in [-1, 1]
+      - self.speeds_kmh: list of ego speeds (km/h)
+      - self.total_steps: number of steps taken in the episode
+      - self.max_steps: maximum allowed steps (timeout)
+      - self.collision_flag: dict with key "flag" set to True if any collision occurred
+      - self.num_red_violations: number of red-light violations
+      - self.done_path: True if loop_complete condition was met
+      - self.collision_ids: set/list of actor ids involved in collisions (added to metrics by caller)
+
+    Returns:
+      total_fitness ∈ [0,1], metrics dict (interpretable sub-metrics)
+    """
+    import math
+    import numpy as np
+
+    # ---------------------------
+    # Configurable targets/limits
+    # ---------------------------
+    desired_speed_kmh = 25.0          # Target cruise speed
+    hard_speed_limit_kmh = 40.0       # Soft rule limit (fractional penalty if exceeded)
+    low_speed_kmh = 2.0               # Considered "near-stop" below this speed
+
+    # Smoothness thresholds (per-step changes; simulator ticks are uniform but unknown dt)
+    steer_rate_comfort = 0.08         # Comfortable mean abs steering change per step
+    speed_dd_comfort = 1.0            # Comfortable mean abs second difference in km/h per step^2
+
+    # Weights for top-level aggregation
+    w_safety = 0.5
+    w_efficiency = 0.3
+    w_smoothness = 0.15
+    w_rules = 0.05
+
+    # Helper: clamp to [0,1]
+    def _clamp01(x):
+        return float(max(0.0, min(1.0, x)))
+
+    # ---------------------------
+    # Gather episode data safely
+    # ---------------------------
+    spd = np.array(getattr(self, "speeds_kmh", []), dtype=np.float32)
+    steer = np.array(getattr(self, "steerings", []), dtype=np.float32)
+
+    N = int(spd.shape[0])
+    collided = bool(self.collision_flag.get("flag", False))
+    num_red = int(getattr(self, "num_red_violations", 0))
+    done = bool(getattr(self, "done_path", False))
+    steps_used = int(getattr(self, "total_steps", 0))
+    max_steps = max(1, int(getattr(self, "max_steps", 1)))
+
+    # Basic speed stats
+    if N > 0:
+        avg_speed = float(np.mean(spd))
+        med_speed = float(np.median(spd))
+        low_speed_frac = float(np.mean(spd < low_speed_kmh))
+        overspeed_frac = float(np.mean(spd > hard_speed_limit_kmh))
+        mae_speed = float(np.mean(np.abs(spd - desired_speed_kmh)))
+    else:
+        avg_speed = 0.0
+        med_speed = 0.0
+        low_speed_frac = 1.0
+        overspeed_frac = 0.0
+        mae_speed = desired_speed_kmh
+
+    # ---------------------------
+    # Safety score
+    # ---------------------------
+    # Any collision zeros safety. Red-light violations reduce safety even without a collision.
+    if collided:
+        safety_score = 0.0
+    else:
+        # Each red violation reduces safety by 0.5 (two or more => 0)
+        safety_score = _clamp01(1.0 - 0.5 * float(num_red))
+
+    # ---------------------------
+    # Efficiency score
+    # ---------------------------
+    # - Completion is primary
+    # - Time-efficiency only counts if the route is completed (finish earlier -> better)
+    # - Speed tracking around the target and avoiding getting stuck also matter
+    completion_score = 1.0 if done else 0.0
+    time_efficiency = (1.0 - float(steps_used) / float(max_steps)) if done else 0.0
+    time_efficiency = _clamp01(time_efficiency)
+
+    # Speed target tracking (closer to desired => higher score)
+    speed_target_score = 1.0 - min(1.0, (mae_speed / max(desired_speed_kmh, 1e-6)))
+
+    # Anti-stall score (less time near-stop => better)
+    stuck_score = _clamp01(1.0 - math.sqrt(max(0.0, low_speed_frac)))
+
+    # Combine into efficiency
+    completion_eff = 0.7 * completion_score + 0.3 * time_efficiency
+    efficiency_score = (
+        0.5
+--- end_source_preview ---
+EASY:
+  episode_file: ep_000.json
+  fitness: 0.891515
+  metrics: avg_speed_kmh:11.785712, collided:0, completion:1, completion_score:1, desired_speed_kmh:25, efficiency_score:0.640885, hard_speed_limit_kmh:40, jerk_score:0.990794, longitudinal_jerk_abs:0.09639, low_speed_fraction:0.501954, mae_speed_to_target_kmh:13.262812, max_steps:8000, median_speed_kmh:1.007653, num_red_violations:0, overspeed_fraction:0, rule_score:1, safety_score:1, smoothness_score:0.994998, speed_target_score:0.469488, steer_rate_mean_abs:0.003757, steer_rate_score:0.9978, steps_used:3582, stuck_score:0.291513, time_efficiency:0.55225, total_fitness:0.891515
+HARD:
+  episodes: 3
+  episode_files: [ep_000.json, ep_001.json, ep_002.json]
+  fitness_per_episode: [0, 0, 0]
+  metrics_per_episode:
+    avg_speed_kmh: [10.738038, 10.264956, 22.443083]
+    collided: [1, 1, 1]
+    completion: [0, 0, 0]
+    completion_score: [0, 0, 0]
+    desired_speed_kmh: [25, 25, 25]
+    efficiency_score: [0.189073, 0.209618, 0.429644]
+    hard_speed_limit_kmh: [40, 40, 40]
+    jerk_score: [0.991913, 0.959485, 0.967904]
+    longitudinal_jerk_abs: [0.090293, 0.205489, 0.182101]
+    low_speed_fraction: [0.543126, 0.314286, 0.048035]
+    mae_speed_to_target_kmh: [14.312948, 14.735046, 2.677192]
+    max_steps: [8000, 8000, 8000]
+    median_speed_kmh: [0.000002, 11.322659, 24.407501]
+    num_red_violations: [0, 0, 0]
+    overspeed_fraction: [0, 0, 0]
+    rule_score: [1, 1, 1]
+    safety_score: [0, 0, 0]
+    smoothness_score: [0.996756, 0.983794, 0.987161]
+    speed_target_score: [0.427482, 0.410598, 0.892912]
+    steer_rate_mean_abs: [0.000311, 0.000033, 0.000019]
+    steer_rate_score: [0.999985, 1, 1]
+    steps_used: [1171, 35, 229]
+    stuck_score: [0.263029, 0.439388, 0.780831]
+    time_efficiency: [0, 0, 0]
+    total_fitness: [0, 0, 0]
+
+=== Fitness Function 003 ===
+source_preview:
+def fitness_function(
+    positions,
+    steerings,
+    speeds_kmh,
+    num_red_violations,
+    collision_flag,
+    collision_ids,
+    total_steps,
+    max_steps,
+    done_path,
+    end_reason,
+    desired_speed_kmh=25.0
+):
+    """
+    Compute a scalar fitness in [0,1] and interpretable metrics for an episode.
+
+    Inputs (all are expected to be available at the end of run_episode):
+      - positions: list of (x, y) tuples (meters), one per control step
+      - steerings: list of steering values in [-1, 1], one per control step
+      - speeds_kmh: list of speeds (km/h), one per control step
+      - num_red_violations: int, number of red-light violations during the episode
+      - collision_flag: bool, True if a collision occurred during the episode
+      - collision_ids: iterable of actor IDs involved in collisions (may be empty)
+      - total_steps: int, number of steps executed
+      - max_steps: int, maximum allowed steps for the episode
+      - done_path: bool, True if the loop/route was completed
+      - end_reason: str, reason the episode ended ("loop_complete", "timeout", "collision", ...)
+      - desired_speed_kmh: float, desired cruise speed (default=25 km/h)
+
+    Returns:
+      - total_fitness: float in [0,1] (higher is better)
+      - metrics: dict with interpretable sub-metrics and components
+                 Note: end_reason and collided_with_ids can be added by the caller if desired.
+    """
+    import math
+    import numpy as np
+
+    # --------- Safe conversions and guards ----------
+    spd = np.asarray(speeds_kmh, dtype=np.float32) if speeds_kmh is not None else np.zeros((0,), dtype=np.float32)
+    st  = np.asarray(steerings, dtype=np.float32)  if steerings  is not None else np.zeros((0,), dtype=np.float32)
+    pos = np.asarray(positions, dtype=np.float32)  if positions  is not None else np.zeros((0, 2), dtype=np.float32)
+
+    N = int(spd.shape[0])
+    # Avoid division by zero and provide sensible defaults when no data is available
+    if N == 0:
+        # No data => return a very low score with reason
+        metrics = {
+            "reason": "no_data",
+            "avg_speed_kmh": 0.0,
+            "moving_fraction": 0.0,
+            "distance_travelled_m": 0.0,
+            "tl_violations": int(num_red_violations or 0),
+            "collision": bool(collision_flag),
+            "collisions_count": len(list(collision_ids)) if collision_ids is not None else 0,
+            "safety_score": 0.0 if collision_flag else 0.2,
+            "compliance_tl_score": 1.0 if (num_red_violations or 0) == 0 else 1.0 / (1.0 + float(num_red_violations)),
+            "compliance_speeding_score": 1.0,
+            "compliance_score": 0.0,  # unknown without signal
+            "smoothness_steer_score": 1.0,
+            "smoothness_speed_score": 1.0,
+            "smoothness_score": 1.0,
+            "efficiency_score": 0.0,
+            "total_fitness": 0.05
+        }
+        # Attach optional fields if provided
+        if end_reason is not None:
+            metrics["end_reason"] = end_reason
+        if collision_ids is not None:
+            metrics["collided_with_ids"] = list(collision_ids)
+        return 0.05, metrics
+
+    # --------- Core episode summaries ----------
+    avg_speed = float(np.mean(spd)) if N > 0 else 0.0
+    moving_fraction = float(np.mean(spd > 2.0)) if N > 0 else 0.0  # proportion of time above 2 km/h
+
+    # Distance travelled (meters) from XY positions (may over-count if weaving; used as info)
+    if pos.shape[0] >= 2:
+        diffs = pos[1:] - pos[:-1]
+        segment_dist = np.linalg.norm(diffs, axis=1)
+        distance_travelled_m = float(np.sum(segment_dist))
+    else:
+        distance_travelled_m = 0.0
+
+    # --------- Safety ----------
+    # Collisions are catastrophic; we convert to a binary safety score.
+    safety_collision_score = 0.0 if collision_flag else 1.0
+    safety_score = safety_collision_score  # For now, safety is dominated by collisions.
+
+    # --------- Rule compliance ----------
+    # 1) Traf
+--- end_source_preview ---
+EASY:
+  episode_file: ep_000.json
+  fitness: 0.134818
+  metrics: avg_speed_kmh:13.974065, collision:1, collision_multiplier:0.25, collisions_count:0, completion_bonus:0, compliance_score:1, compliance_speeding_score:1, compliance_tl_score:1, distance_travelled_m:586.135681, efficiency_score:1, moving_fraction:0.585705, overspeed_mean_kmh:0, safety_collision_score:0, safety_score:0, smoothness_score:0.928489, smoothness_speed_score:0.908596, smoothness_steer_score:0.94175, tl_multiplier:1, tl_violations:0, total_fitness:0.134818
+HARD:
+  episodes: 3
+  episode_files: [ep_000.json, ep_001.json, ep_002.json]
+  fitness_per_episode: [0.124713, 0.127035, 0.124675]
+  metrics_per_episode:
+    avg_speed_kmh: [22.454344, 23.689428, 22.451767]
+    collision: [1, 1, 1]
+    collision_multiplier: [0.25, 0.25, 0.25]
+    collisions_count: [1, 1, 1]
+    completion_bonus: [0, 0, 0]
+    compliance_score: [1, 1, 1]
+    compliance_speeding_score: [1, 1, 1]
+    compliance_tl_score: [1, 1, 1]
+    distance_travelled_m: [71.583733, 174.245316, 71.579002]
+    efficiency_score: [0.832656, 0.86707, 0.83261]
+    moving_fraction: [0.952174, 0.979245, 0.952174]
+    overspeed_mean_kmh: [0, 0, 0]
+    safety_collision_score: [0, 0, 0]
+    safety_score: [0, 0, 0]
+    smoothness_score: [0.93793, 0.942491, 0.93698]
+    smoothness_speed_score: [0.845289, 0.865909, 0.842841]
+    smoothness_steer_score: [0.999691, 0.993546, 0.999739]
+    tl_multiplier: [1, 1, 1]
+    tl_violations: [0, 0, 0]
+    total_fitness: [0.124713, 0.127035, 0.124675]
+
+=== Fitness Function 004 ===
+source_preview:
+import math
+import numpy as np
+
+def fitness_function():
+    """
+    Computes a holistic fitness score ∈ [0, 1] for a CARLA driving episode.
+    Goals encoded: safety, efficiency, smoothness, and rule compliance.
+    Assumptions:
+      - desired cruise speed is 25 km/h
+      - inputs are read from the environment's state (self.*) available in run_episode
+    Notes:
+      - The simulator will overwrite metrics["end_reason"] and metrics["collided_with_ids"] after this call.
+      - This function is robust to short/empty episodes.
+    """
+
+    # Short helpers
+    def _clip01(x): return float(max(0.0, min(1.0, x)))
+    def _safe_mean(arr):
+        arr = np.asarray(arr)
+        return float(np.mean(arr)) if arr.size > 0 else 0.0
+    def _safe_median(arr):
+        arr = np.asarray(arr)
+        return float(np.median(arr)) if arr.size > 0 else 0.0
+
+    # -------------------------
+    # Gather signals from logs
+    # -------------------------
+    desired_speed_kmh = 25.0
+    # safety overspeed threshold (km/h) beyond which we consider it unsafe
+    safety_vmax_kmh = 35.0
+
+    # Arrays
+    v_kmh = np.array(getattr(self, "speeds_kmh", []), dtype=np.float32)
+    steer = np.array(getattr(self, "steerings", []), dtype=np.float32)
+    pos_arr = np.array(getattr(self, "positions", []), dtype=np.float32)
+
+    n = int(v_kmh.size)
+    n_steps = int(getattr(self, "total_steps", 0))
+    max_steps = int(getattr(self, "max_steps", max(1, n_steps)))
+
+    # Collision and violations
+    collided = bool(getattr(self, "collision_flag", {"flag": False}).get("flag", False))
+    red_viol = int(getattr(self, "num_red_violations", 0))
+    done_path = bool(getattr(self, "done_path", False))
+
+    # Path length if available
+    L_path_m = float(getattr(self, "L", 0.0)) if hasattr(self, "L") else 0.0
+
+    # -------------------------
+    # Derived features
+    # -------------------------
+    # Distance traveled (meters)
+    if pos_arr.shape[0] >= 2:
+        step_vecs = np.diff(pos_arr, axis=0)
+        step_dists = np.linalg.norm(step_vecs, axis=1)
+        dist_traveled_m = float(np.sum(step_dists))
+    else:
+        dist_traveled_m = 0.0
+
+    # Completion ratio estimate
+    if done_path:
+        completion_ratio = 1.0
+    else:
+        if L_path_m > 1e-6:
+            completion_ratio = _clip01(dist_traveled_m / L_path_m)
+        else:
+            # Fallback: unknown loop length → provide a conservative neutral score
+            completion_ratio = 0.5
+
+    # Basic speed stats
+    mean_speed_kmh = _safe_mean(v_kmh)
+    median_speed_kmh = _safe_median(v_kmh)
+    max_speed_kmh = float(np.max(v_kmh)) if n > 0 else 0.0
+
+    # Moving mask (ignore standstill for adherence)
+    moving_mask = v_kmh > 0.5
+    if np.any(moving_mask):
+        speed_mae_kmh = float(np.mean(np.abs(v_kmh[moving_mask] - desired_speed_kmh)))
+    else:
+        # If never moved, set large error
+        speed_mae_kmh = desired_speed_kmh
+
+    # Idle fraction (time spent nearly stopped)
+    idle_frac = float(np.mean(v_kmh <= 1.0)) if n > 0 else 1.0
+
+    # Speed differences (per-step)
+    dv_kmh = np.diff(v_kmh) if n > 1 else np.array([], dtype=np.float32)
+    mean_abs_dv = float(np.mean(np.abs(dv_kmh))) if dv_kmh.size > 0 else 0.0
+
+    # Steering rate (per-step change magnitude)
+    dsteer = np.diff(steer) if steer.size > 1 else np.array([], dtype=np.float32)
+    mean_abs_dsteer = float(np.mean(np.abs(dsteer))) if dsteer.size > 0 else 0.0
+
+    # Hard deceleration events (proxy for harsh braking/comfort)
+    # Threshold is per-step drop in km/h; since dt is unknown, we use a conservative threshold.
+    hard_decel_thresh_kmh = 4.0
+    hard_decel_events = int(np.sum(dv_kmh < -hard_decel_thresh_kmh)) if dv_kmh.size > 0 else 0
+    hard_brake_rate = (hard_decel_events / max(1, dv_kmh.size)) if dv_kmh.size > 0 else 1.0
+
+    # Overspeeding fraction beyond the safety threshold
+    overspeed_frac = float(np.mean(v_kmh > safety_vmax_kmh)) if n > 0 else 0.0
+
+    # Steps fraction used (for time efficiency proxy)
+--- end_source_preview ---
+EASY:
+  episode_file: ep_000.json
+  fitness: 0.899484
+  metrics: collided:0, completion_ratio:1, compliance_score:1, dist_traveled_m:586.081787, done_path:1, efficiency_score:0.683659, hard_brake_rate:0.004186, idle_fraction:0.500279, max_speed_kmh:26.090864, max_steps:8000, mean_abs_speed_delta_kmh:0.166139, mean_abs_steer_delta:0.004073, mean_speed_kmh:11.781385, median_speed_kmh:0.888503, num_red_violations:0, overspeed_fraction:0, path_length_m_est:592.081665, safety_score:0.998325, smoothness_score:0.967598, speed_target_mae_kmh:1.578347, steps_used:3584, time_score:0.552, total_fitness:0.899484
+HARD:
+  episodes: 3
+  episode_files: [ep_000.json, ep_001.json, ep_002.json]
+  fitness_per_episode: [0.036389, 0.035728, 0.036292]
+  metrics_per_episode:
+    collided: [1, 1, 1]
+    completion_ratio: [0.127254, 0.290094, 0.120894]
+    compliance_score: [1, 1, 1]
+    dist_traveled_m: [75.344963, 171.759399, 71.579224]
+    done_path: [0, 0, 0]
+    efficiency_score: [0.398386, 0.367975, 0.395405]
+    hard_brake_rate: [0, 0.002586, 0]
+    idle_fraction: [0.045643, 0.544358, 0.047826]
+    max_speed_kmh: [26.085981, 26.085981, 26.085981]
+    max_steps: [8000, 8000, 8000]
+    mean_abs_speed_delta_kmh: [0.309463, 0.159562, 0.314269]
+    mean_abs_steer_delta: [0.000035, 0.000019, 0.000019]
+    mean_speed_kmh: [22.552237, 10.660101, 22.451817]
+    median_speed_kmh: [24.407501, 0.000002, 24.404688]
+    num_red_violations: [0, 0, 0]
+    overspeed_fraction: [0, 0, 0]
+    path_length_m_est: [592.081665, 592.081665, 592.081665]
+    safety_score: [0, 0, 0]
+    smoothness_score: [0.962503, 0.979232, 0.96202]
+    speed_target_mae_kmh: [1.49408, 1.716739, 1.547839]
+    steps_used: [241, 1161, 230]
+    time_score: [0.484938, 0.427438, 0.485625]
+    total_fitness: [0.036389, 0.035728, 0.036292]
+
+=== Fitness Function 005 ===
+source_preview:
+def fitness_function():
+    """
+    Computes a scalar fitness in [0,1] and a metrics dictionary that reflects:
+      - Safety (no collisions, no hard braking)
+      - Efficiency (progress, speed tracking toward 25 km/h, minimal idling)
+      - Smoothness (low steering rate and jerk)
+      - Rule compliance (no red light violations, no overspeeding)
+    Assumptions:
+      - This function is called at the end of run_episode(), where `self` holds logs:
+        self.positions: [(x,y), ...]
+        self.steerings: [steer_t, ...]  steer in [-1,1]
+        self.speeds_kmh: [v_kmh_t, ...]
+        self.num_red_violations: int
+        self.collision_flag: {"flag": bool}
+        self.collision_ids: set / list
+        self.done_path: bool
+        self.L: float (path length in meters)
+        self.world.get_settings().fixed_delta_seconds (if available)
+      - Desired cruise speed is 25 km/h.
+      - If a collision occurs, total fitness is 0.
+    Note:
+      - metrics["end_reason"] and metrics["collided_with_ids"] will be set by the caller as well.
+    """
+    import math
+    import numpy as np
+
+    def _clip01(x):
+        return max(0.0, min(1.0, float(x)))
+
+    metrics = {}
+
+    # Retrieve logs safely
+    speeds_kmh = np.array(getattr(self, "speeds_kmh", []), dtype=np.float32)
+    steer = np.array(getattr(self, "steerings", []), dtype=np.float32)
+    pos_arr = np.array(getattr(self, "positions", []), dtype=np.float32)
+
+    N = int(speeds_kmh.size)
+    collided = bool(getattr(self, "collision_flag", {}).get("flag", False))
+    red_violations = int(getattr(self, "num_red_violations", 0))
+    done_path = bool(getattr(self, "done_path", False))
+    collided_ids = list(getattr(self, "collision_ids", []))
+
+    # Time step: use CARLA fixed_delta_seconds if available, else assume 0.05s (20 Hz)
+    dt = 0.05
+    try:
+        ws = self.world.get_settings()
+        if hasattr(ws, "fixed_delta_seconds") and ws.fixed_delta_seconds and ws.fixed_delta_seconds > 0:
+            dt = float(ws.fixed_delta_seconds)
+    except Exception:
+        pass
+
+    total_time_s = float(N * dt)
+    speeds_mps = speeds_kmh / 3.6 if N > 0 else np.zeros((0,), dtype=np.float32)
+
+    # Distance traveled (Euclidean along logged positions)
+    if pos_arr.shape[0] >= 2:
+        diffs = np.diff(pos_arr, axis=0)
+        step_d = np.linalg.norm(diffs, axis=1)
+        dist_travelled_m = float(np.sum(step_d))
+    else:
+        dist_travelled_m = 0.0
+
+    # Reference loop length (if available)
+    loop_len_m = float(getattr(self, "L", max(1.0, dist_travelled_m)))
+
+    # ---------- Safety ----------
+    # Hard braking detection based on longitudinal acceleration threshold
+    if N >= 2:
+        accels = np.diff(speeds_mps) / max(dt, 1e-3)  # m/s^2
+        hard_brake_thr = -3.5  # m/s^2 (strong decel)
+        hard_brake_rate = float(np.mean(accels < hard_brake_thr)) if accels.size > 0 else 0.0
+        decel_rms = float(np.sqrt(np.mean(np.square(np.minimum(accels, 0.0))))) if accels.size > 0 else 0.0
+    else:
+        accels = np.zeros((0,), dtype=np.float32)
+        hard_brake_rate = 0.0
+        decel_rms = 0.0
+
+    # Safety score: collision => 0, otherwise penalize hard brakes
+    if collided:
+        safety_score = 0.0
+    else:
+        # Up to 50% penalty if constantly hard-braking
+        safety_score = _clip01(1.0 - 0.5 * hard_brake_rate)
+
+    # ---------- Rule compliance ----------
+    # Red-light violations (heavy)
+    tl_score = 1.0 / (1.0 + max(0, red_violations))  # 0: none ->1.0, 1->0.5, 2->0.33, ...
+
+    # Overspeeding: penalize fraction above gentle city-like cap (35/45 km/h tiers)
+    if N > 0:
+        overs35_frac = float(np.mean(speeds_kmh > 35.0))
+        overs45_frac = float(np.mean(speeds_kmh > 45.0))
+    else:
+        overs35_frac = 0.0
+        overs45_frac = 0.0
+    overspeed_penalty = min(1.0, 0.7 * overs35_frac + 0.3 * overs45_frac)
+    speed_limit_score = _clip01(1.0 - oversspeed_penalty) if (oversspeed_penalty := overspeed_penalty) is not None else 1.0
+
+    rul
+--- end_source_preview ---
+EASY:
+  episode_file: ep_000.json
+  fitness: 0.861523
+  metrics: avg_speed_kmh:11.785712, collided:0, decel_rms_mps2:1.892842, distance_travelled_m:585.978638, done_path:1, efficiency_score:0.790846, fitness:0.861523, hard_brake_rate:0.009495, idle_fraction:0.5, jerk_rms_mps3:25.651909, loop_length_m:592.081665, overspeed_frac_>35:0, overspeed_frac_>45:0, progress_fraction:1, red_light_violations:0, rule_score:1, safety_score:0.995253, smoothness_score:0.264049, speed_mae_to_25_kmh:13.262812, steer_rate_rms_per_s:0.330331, total_time_s:179.1
+HARD:
+  episodes: 3
+  episode_files: [ep_000.json, ep_001.json, ep_002.json]
+  fitness_per_episode: [0, 0, 0]
+  metrics_per_episode:
+    avg_speed_kmh: [22.460815, 22.48274, 10.633735]
+    collided: [1, 1, 1]
+    decel_rms_mps2: [0.967619, 0.975563, 0.045612]
+    distance_travelled_m: [71.918358, 72.61055, 5.179844]
+    done_path: [0, 0, 0]
+    efficiency_score: [0.436217, 0.437235, 0.202298]
+    fitness: [0, 0, 0]
+    hard_brake_rate: [0, 0, 0]
+    idle_fraction: [0.047619, 0.04721, 0.305556]
+    jerk_rms_mps3: [28.642904, 29.106398, 46.490891]
+    loop_length_m: [592.081665, 592.081665, 592.081665]
+    overspeed_frac_>35: [0, 0, 0]
+    overspeed_frac_>45: [0, 0, 0]
+    progress_fraction: [0.121467, 0.122636, 0.008749]
+    red_light_violations: [0, 0, 0]
+    rule_score: [1, 1, 1]
+    safety_score: [0, 0, 0]
+    smoothness_score: [0.497634, 0.499364, 0.498556]
+    speed_mae_to_25_kmh: [2.658416, 2.635481, 14.366267]
+    steer_rate_rms_per_s: [0.003312, 0.000891, 0.002021]
+    total_time_s: [11.55, 11.65, 1.8]
+
+=== Fitness Function 006 ===
+source_preview:
+import math
+import numpy as np
+
+def fitness_function(self):
+    """
+    Compute a scalar fitness in [0, 1] and a metrics dictionary for a CARLA episode.
+    Inputs are read from the episode state stored on `self` (positions, speeds, flags, etc.).
+    This function prioritizes: safety, efficiency, smoothness, and rule compliance.
+    Desired cruise speed is 25 km/h.
+    """
+    metrics = {}
+    # ----------------------------
+    # Helpers and safe extraction
+    # ----------------------------
+    def _clip01(x):  # clamp into [0,1]
+        return float(max(0.0, min(1.0, x)))
+
+    # Basic arrays
+    speeds_kmh = np.array(getattr(self, "speeds_kmh", []), dtype=np.float32)
+    speeds_ms = speeds_kmh / 3.6 if speeds_kmh.size > 0 else np.zeros((0,), dtype=np.float32)
+    steers = np.array(getattr(self, "steerings", []), dtype=np.float32)
+    positions = np.array(getattr(self, "positions", []), dtype=np.float32)
+
+    N = int(speeds_kmh.size)
+    desired_kmh = 25.0  # target cruise
+
+    # Timesteps info
+    total_steps = int(getattr(self, "total_steps", N))
+    max_steps = int(getattr(self, "max_steps", max(1, total_steps)))
+    used_steps_ratio = float(total_steps) / float(max(1, max_steps))
+
+    # Safety / flags
+    collided = bool(getattr(self, "collision_flag", {}).get("flag", False))
+    red_viol = int(getattr(self, "num_red_violations", 0))
+    done_path = bool(getattr(self, "done_path", False))
+
+    # ----------------------------
+    # Route geometry (if available)
+    # ----------------------------
+    have_route_geom = all([
+        hasattr(self, "A"), hasattr(self, "AB"),
+        hasattr(self, "seg_len"), hasattr(self, "s_before"),
+        hasattr(self, "s0"), hasattr(self, "L")
+    ])
+    lane_half_default = 1.75  # fallback lane half-width meters
+    lane_half = float(getattr(self, "LANE_HALF", lane_half_default))
+
+    # Progress and lane metrics
+    progress_m = 0.0
+    progress_frac = 0.0
+    mean_abs_lat = None
+    out_of_lane_frac = None
+
+    if positions.shape[0] > 0 and have_route_geom:
+        # End progress along path
+        last_xy = positions[-1]
+        try:
+            s_end, lat_end, k, t, proj_xy = project_point_onto_loop(
+                last_xy, self.A, self.AB, self.seg_len, self.s_before
+            )
+            progress_m = float(wrap_forward_progress(s_end, float(self.s0), float(self.L)))
+            progress_frac = progress_m / max(float(self.L), 1e-6)
+            progress_frac = _clip01(progress_frac)
+        except Exception:
+            progress_m = 0.0
+            progress_frac = 0.0
+
+        # Lane adherence over the whole trajectory (mean lateral deviation, out-of-lane fraction)
+        lats = []
+        out_flags = []
+        try:
+            for xy in positions:
+                s_w, lat_w, k, t, proj_xy = project_point_onto_loop(
+                    xy, self.A, self.AB, self.seg_len, self.s_before
+                )
+                lats.append(abs(float(lat_w)))
+                out_flags.append(1.0 if abs(float(lat_w)) > lane_half else 0.0)
+            if len(lats) > 0:
+                mean_abs_lat = float(np.mean(np.array(lats, dtype=np.float32)))
+                out_of_lane_frac = float(np.mean(np.array(out_flags, dtype=np.float32)))
+        except Exception:
+            mean_abs_lat = None
+            out_of_lane_frac = None
+
+    # Fallback progress if route geom not available: use relative distance travelled vs. rough loop length if known
+    if not have_route_geom and positions.shape[0] > 1:
+        # Approximate progress as straight-line from start to end divided by path length if available
+        dist = float(np.linalg.norm(positions[-1] - positions[0]))
+        loop_len = float(getattr(self, "L", dist))
+        progress_m = dist
+        progress_frac = _clip01(dist / max(loop_len, 1e-6))
+
+    # ----------------------------
+    # Safety and rule compliance scores (0..1)
+    # ----------------------------
+    # Collisions: hard zero if any collision
+    collision_score = 0.0 if collided
+--- end_source_preview ---
+EASY:
+  episode_file: ep_000.json
+  fitness: 0.797291
+  metrics: avg_moving_speed_kmh:23.568829, avg_speed_kmh:11.785712, brake_smooth_score:0.992181, collision:0, collision_score:1, desired_speed_kmh:25, done_path:1, efficiency_score:0.276125, have_route_geometry:1, lane_half_m:1.75, lane_score:0.7, longi_smooth_score:0.923274, mean_abs_dsteer_per_tick:0.003757, mean_abs_dv_mps_per_tick:0.046036, num_red_violations:0, overspeed_frac:0, pct_time_stopped:0.499162, progress_frac:0, progress_m:0, redlight_score:1, smoothness_score:0.951938, speed_score:0.942753, steer_smooth_score:0.95304, time_eff_score:0.55225, total_fitness:0.797291, used_steps_ratio:0.44775
+HARD:
+  episodes: 3
+  episode_files: [ep_000.json, ep_001.json, ep_002.json]
+  fitness_per_episode: [0.40359, 0.440643, 0.444981]
+  metrics_per_episode:
+    avg_moving_speed_kmh: [15.649416, 23.179152, 23.408777]
+    avg_speed_kmh: [11.006395, 11.951012, 10.659038]
+    brake_smooth_score: [1, 0.991342, 0.994889]
+    collision: [1, 1, 1]
+    collision_score: [0, 0, 0]
+    desired_speed_kmh: [25, 25, 25]
+    done_path: [0, 0, 0]
+    efficiency_score: [0, 0, 0]
+    have_route_geometry: [1, 1, 1]
+    lane_half_m: [1.75, 1.75, 1.75]
+    lane_score: [0.7, 0.7, 0.7]
+    longi_smooth_score: [0.690367, 0.910838, 0.926382]
+    mean_abs_dsteer_per_tick: [0.000079, 0.002989, 0.0002]
+    mean_abs_dv_mps_per_tick: [0.18578, 0.053497, 0.044171]
+    num_red_violations: [0, 0, 0]
+    overspeed_frac: [0, 0, 0]
+    pct_time_stopped: [0.297297, 0.483057, 0.544681]
+    progress_frac: [0, 0, 0]
+    progress_m: [0, 0, 0]
+    redlight_score: [1, 1, 1]
+    smoothness_score: [0.906616, 0.952841, 0.97564]
+    speed_score: [0.625977, 0.927166, 0.936351]
+    steer_smooth_score: [0.999011, 0.962642, 0.997496]
+    time_eff_score: [0, 0, 0]
+    total_fitness: [0.40359, 0.440643, 0.444981]
+    used_steps_ratio: [0.004625, 0.173375, 0.146875]
+
+=== Fitness Function 007 ===
+source_preview:
+def fitness_function():
+    """
+    Compute overall fitness and interpretable sub-metrics for a CARLA driving episode.
+    This function is designed to be called at the end of run_episode() and assumes that
+    the following attributes exist in the scope (via `self`):
+      - self.positions:    list of (x, y) positions per tick
+      - self.steerings:    list of steering values in [-1, 1] per tick
+      - self.speeds_kmh:   list of ego speeds in km/h per tick
+      - self.num_red_violations: integer count of red-light violations
+      - self.collision_flag: dict with key "flag" -> bool
+      - self.done_path:    bool, True if loop completed
+      - self.total_steps:  total number of ticks taken
+      - self.max_steps:    episode step limit
+      - self.L:            planned loop length in meters (float)
+      - self.collision_ids: set/list of collided actor ids (added upstream to metrics)
+    Returns:
+      total_fitness ∈ [0, 1], metrics_dict
+    """
+    import math
+    import numpy as np
+
+    # ---------- helpers ----------
+    def clamp01(x):
+        return 0.0 if x <= 0.0 else (1.0 if x >= 1.0 else float(x))
+
+    def safe_mean(arr, default=0.0):
+        return float(np.mean(arr)) if arr.size > 0 else float(default)
+
+    # ---------- extract logs (robust to missing) ----------
+    try:
+        pos_arr = np.array(self.positions, dtype=float) if getattr(self, "positions", None) else np.zeros((0, 2), dtype=float)
+    except Exception:
+        pos_arr = np.zeros((0, 2), dtype=float)
+
+    try:
+        speeds = np.array(self.speeds_kmh, dtype=float) if getattr(self, "speeds_kmh", None) else np.zeros((0,), dtype=float)
+    except Exception:
+        speeds = np.zeros((0,), dtype=float)
+
+    try:
+        steers = np.array(self.steerings, dtype=float) if getattr(self, "steerings", None) else np.zeros((0,), dtype=float)
+    except Exception:
+        steers = np.zeros((0,), dtype=float)
+
+    num_steps = int(getattr(self, "total_steps", len(speeds)))
+    max_steps = max(1, int(getattr(self, "max_steps", max(1, num_steps))))
+    loop_len_m = float(getattr(self, "L", 0.0))
+    done_path = bool(getattr(self, "done_path", False))
+    collided = bool(getattr(self, "collision_flag", {}).get("flag", False))
+    red_viol = int(getattr(self, "num_red_violations", 0))
+
+    # ---------- geometry / distance traveled ----------
+    if pos_arr.shape[0] >= 2:
+        diffs = np.diff(pos_arr, axis=0)
+        step_dists = np.linalg.norm(diffs, axis=1)
+        travel_dist_m = float(np.sum(step_dists))
+    else:
+        travel_dist_m = 0.0
+
+    # If loop length L is unknown or invalid, fallback to traveled distance to avoid div by zero.
+    norm_L = loop_len_m if loop_len_m > 1e-6 else max(1.0, travel_dist_m)
+    progress_frac = clamp01(travel_dist_m / norm_L)
+
+    # ---------- speed-related metrics ----------
+    desired_kmh = 25.0
+    # Band around desired for "compliance" time fraction (±20%)
+    band_low = 0.8 * desired_kmh  # 20 km/h
+    band_high = 1.2 * desired_kmh # 30 km/h
+
+    if speeds.size > 0:
+        mae_speed = float(np.mean(np.abs(speeds - desired_kmh)))
+        in_band_frac = float(np.mean((speeds >= band_low) & (speeds <= band_high)))
+        overspeed_high_frac = float(np.mean(speeds > 40.0))  # Unsafe overspeed threshold
+        stop_frac = float(np.mean(speeds < 2.0))             # fraction of near-standstill
+        avg_speed_kmh = float(np.mean(speeds))
+        med_speed_kmh = float(np.median(speeds))
+    else:
+        mae_speed = desired_kmh
+        in_band_frac = 0.0
+        overspeed_high_frac = 0.0
+        stop_frac = 1.0
+        avg_speed_kmh = 0.0
+        med_speed_kmh = 0.0
+
+    # Smoothness via speed and steering derivatives (RMS of diffs)
+    if speeds.size >= 2:
+        dv = np.diff(speeds)  # km/h per tick (dt unknown; use relative magnitude)
+        rms_dv = float(math.sqrt(np.mean(dv * dv)))
+    else:
+        rms_dv = 0.0
+
+    if steers.size >= 2:
+        dsteer = np.diff(steers)
+        rms_dsteer = float(math.sqrt(np.
+--- end_source_preview ---
+EASY:
+  episode_file: ep_000.json
+  fitness: 1
+  metrics: avg_speed_kmh:11.796692, collided:0, distance_travel_m:586.177031, done_path:1, efficiency_score:0.94729, in_band_speed_frac_20_30_kmh:0.461732, large_steer_rate_frac_gt0p30:0, max_steps:8000, median_speed_kmh:1.023794, num_red_violations:0, overspeed_high_frac_gt40:0, path_length_m:592.081665, progress_frac:0.990027, rms_dsteer_per_tick:0.016614, rms_dv_kmh_per_tick:0.407175, rule_score:1, safety_score:1, smoothness_score:0.918958, speed_mae_kmh:13.25195, steps:3580, stop_fraction_lt2kmh:0.501397, total_fitness:1
+HARD:
+  episodes: 3
+  episode_files: [ep_000.json, ep_001.json, ep_002.json]
+  fitness_per_episode: [0.38581, 0.399436, 0.357269]
+  metrics_per_episode:
+    avg_speed_kmh: [22.451502, 21.265546, 14.513158]
+    collided: [1, 1, 1]
+    distance_travel_m: [71.577599, 173.824468, 173.819394]
+    done_path: [0, 0, 0]
+    efficiency_score: [0.474548, 0.529743, 0.383896]
+    in_band_speed_frac_20_30_kmh: [0.869565, 0.825127, 0.563152]
+    large_steer_rate_frac_gt0p30: [0, 0, 0]
+    max_steps: [8000, 8000, 8000]
+    median_speed_kmh: [24.404687, 24.388647, 24.033799]
+    num_red_violations: [0, 0, 0]
+    overspeed_high_frac_gt40: [0, 0, 0]
+    path_length_m: [592.081665, 592.081665, 592.081665]
+    progress_frac: [0.120891, 0.293582, 0.293573]
+    rms_dsteer_per_tick: [0.000337, 0.004283, 0.00352]
+    rms_dv_kmh_per_tick: [0.447395, 0.548916, 0.453883]
+    rule_score: [1, 1, 1]
+    safety_score: [0, 0, 0]
+    smoothness_score: [0.956306, 0.936754, 0.947334]
+    speed_mae_kmh: [2.668249, 3.835469, 10.555779]
+    steps: [230, 589, 863]
+    stop_fraction_lt2kmh: [0.047826, 0.095076, 0.382387]
+    total_fitness: [0.38581, 0.399436, 0.357269]
+
+=== Fitness Function 008 ===
+source_preview:
+def fitness_score():
+    """
+    Computes a scalar fitness in [0, 1] and a dictionary of interpretable sub-metrics
+    for a completed CARLA driving episode. This function relies on data collected
+    during run_episode(), accessed via `self`.
+
+    It evaluates four primary goals:
+      - Safety (no collisions, low overspeeding, red-light compliance)
+      - Efficiency (route progress, moving ratio, speed tracking to 25 km/h)
+      - Smoothness (low steering rate, low speed jitter)
+      - Rule compliance (red-light adherence, overspeeding fraction)
+
+    Assumptions:
+      - Desired speed = 25 km/h.
+      - Episode logs are in:
+          self.positions (list of (x,y)),
+          self.steerings (list of float),
+          self.speeds_kmh (list of float)
+      - Route references:
+          self.A, self.AB, self.seg_len, self.s_before, self.s0, self.L
+        and helper functions project_point_onto_loop, wrap_forward_progress are available.
+      - Termination/context:
+          self.total_steps, self.max_steps, self.done_path
+          self.collision_flag, self.collision_ids, self.num_red_violations
+    """
+    import math
+    import numpy as np
+
+    # Helper: clamp to [0,1]
+    def clamp01(x):
+        return 0.0 if x <= 0.0 else (1.0 if x >= 1.0 else float(x))
+
+    # Defensive: obtain arrays
+    positions = getattr(self, "positions", [])
+    steerings = getattr(self, "steerings", [])
+    speeds_kmh = getattr(self, "speeds_kmh", [])
+
+    pos_arr = np.array(positions, dtype=np.float32) if positions else np.zeros((0, 2), dtype=np.float32)
+    steer_arr = np.array(steerings, dtype=np.float32) if steerings else np.zeros((0,), dtype=np.float32)
+    spd_kmh_arr = np.array(speeds_kmh, dtype=np.float32) if speeds_kmh else np.zeros((0,), dtype=np.float32)
+    spd_mps_arr = spd_kmh_arr / 3.6
+
+    n = int(spd_kmh_arr.shape[0])
+    steps = int(getattr(self, "total_steps", n))
+    max_steps = max(int(getattr(self, "max_steps", max(steps, 1))), 1)
+
+    # Desired speed
+    v_des_kmh = 25.0
+    v_des_mps = v_des_kmh / 3.6
+
+    # Distance traveled (geodesic along the logged polyline)
+    if pos_arr.shape[0] >= 2:
+        diffs = pos_arr[1:, :] - pos_arr[:-1, :]
+        seg_d = np.linalg.norm(diffs, axis=1)
+        dist_travelled_m = float(np.sum(seg_d))
+    else:
+        dist_travelled_m = 0.0
+
+    # Route progress fraction using provided loop projection utilities if available
+    progress_frac = 0.0
+    progress_m = 0.0
+    try:
+        if pos_arr.shape[0] >= 1:
+            last_xy = pos_arr[-1, :]
+            s_now, *_ = project_point_onto_loop(last_xy, self.A, self.AB, self.seg_len, self.s_before)
+            progress_m = float(wrap_forward_progress(s_now, self.s0, self.L))
+            L = float(max(getattr(self, "L", 0.0), 1e-6))
+            progress_frac = clamp01(progress_m / L)
+        else:
+            progress_m = 0.0
+            progress_frac = 0.0
+    except Exception:
+        # Fallback if projection helpers missing: approximate by path-length fraction
+        L = float(max(getattr(self, "L", 0.0), 1e-6))
+        progress_m = float(min(dist_travelled_m, L))
+        progress_frac = clamp01(progress_m / L)
+
+    # Moving ratio (fraction of steps above a crawl speed)
+    moving_mask = (spd_kmh_arr > 2.0) if n > 0 else np.zeros((0,), dtype=bool)
+    moving_ratio = float(np.mean(moving_mask)) if n > 0 else 0.0
+
+    # Speed tracking (ignore near-standstill frames to avoid penalizing required stops)
+    if np.any(moving_mask):
+        mae_kmh = float(np.mean(np.abs(spd_kmh_arr[moving_mask] - v_des_kmh)))
+    else:
+        mae_kmh = v_des_kmh  # if never moved, worst-case error
+    speed_tracking_score = clamp01(1.0 - (mae_kmh / max(v_des_kmh, 1e-6)))
+    avg_speed_kmh = float(np.mean(spd_kmh_arr)) if n > 0 else 0.0
+    med_speed_kmh = float(np.median(spd_kmh_arr)) if n > 0 else 0.0
+
+    # Overspeeding metrics (tolerance above desired)
+    overspd_thr_kmh = v_des_kmh + 6.0  # 6 km/h buffer
+    if n > 0:
+        excess = spd_kmh_arr - overspd_t
+--- end_source_preview ---
+EASY:
+  episode_file: ep_000.json
+  fitness: 1
+  metrics: accel_smoothness_score:0.876753, avg_speed_kmh:11.785712, base_efficiency:0.866781, collided:0, collision_score:1, desired_speed_kmh:25, distance_travelled_m:585.978638, done_path:1, efficiency_score:0.889447, fitness_total:1, max_steps:8000, mean_abs_dv_mps_per_step:0.046036, mean_abs_steer_rate_per_step:0.003757, median_speed_kmh:1.007653, moving_ratio:0.498046, overspeed_mean_excess_kmh:0, overspeed_safety_score:1, overspeed_time_frac:0, progress_frac:0.989692, progress_m:585.978638, red_light_violations:0, redlight_score:1, rule_compliance_score:1, safety_score:1, smoothness_score:0.926009, speed_mae_kmh:1.441609, speed_tracking_score:0.942336, steering_smoothness_score:0.975265, total_steps:3582
+HARD:
+  episodes: 3
+  episode_files: [ep_000.json, ep_001.json, ep_002.json]
+  fitness_per_episode: [0, 0, 0]
+  metrics_per_episode:
+    accel_smoothness_score: [0.779961, 0.774924, 0.778967]
+    avg_speed_kmh: [22.536236, 21.647989, 22.451355]
+    base_efficiency: [0.333077, 0.451732, 0.328713]
+    collided: [1, 1, 1]
+    collision_score: [0, 0, 0]
+    desired_speed_kmh: [25, 25, 25]
+    distance_travelled_m: [74.667999, 174.854385, 71.57843]
+    done_path: [0, 0, 0]
+    efficiency_score: [0.257562, 0.298436, 0.25576]
+    fitness_total: [0, 0, 0]
+    max_steps: [8000, 8000, 8000]
+    mean_abs_dv_mps_per_step: [0.086979, 0.089246, 0.087426]
+    mean_abs_steer_rate_per_step: [0.00002, 0.000637, 0.000026]
+    median_speed_kmh: [24.409851, 24.401678, 24.404688]
+    moving_ratio: [0.953975, 0.920962, 0.952174]
+    overspeed_mean_excess_kmh: [0, 0, 0]
+    overspeed_safety_score: [1, 1, 1]
+    overspeed_time_frac: [0, 0, 0]
+    progress_frac: [0.126111, 0.295321, 0.120893]
+    progress_m: [74.667999, 174.854385, 71.57843]
+    red_light_violations: [0, 0, 0]
+    redlight_score: [1, 1, 1]
+    rule_compliance_score: [1, 1, 1]
+    safety_score: [0.3, 0.3, 0.3]
+    smoothness_score: [0.889915, 0.885344, 0.889396]
+    speed_mae_kmh: [1.502483, 1.611752, 1.548323]
+    speed_tracking_score: [0.939901, 0.93553, 0.938067]
+    steering_smoothness_score: [0.99987, 0.995764, 0.999825]
+    total_steps: [239, 582, 230]
+
+=== Fitness Function 010 ===
+source_preview:
+def fitness_function():
+    """
+    Computes a scalar fitness ∈ [0,1] and an interpretable metrics dict for a CARLA driving episode.
+    Assumptions:
+      - This function is called at the end of run_episode(), with access to `self` attributes.
+      - Uses only numpy and math.
+    Goals reflected:
+      - Safety (collision-free, low harsh dynamics)
+      - Rule compliance (no red-light violations, avoid prolonged overspeeding)
+      - Efficiency (track desired speed ~25 km/h, minimize idling, complete loop)
+      - Smoothness (low steering rate and low speed jerk/accel)
+    Returns:
+      total_fitness: float in [0,1]
+      metrics: dict of sub-metrics (end_reason and collided_with_ids will be added by the caller)
+    """
+    import math
+    import numpy as np
+
+    # Helper functions
+    def clamp(x, lo=0.0, hi=1.0):
+        return float(max(lo, min(hi, x)))
+
+    def safe_mean(arr, default=0.0):
+        return float(np.mean(arr)) if (arr is not None and len(arr) > 0) else float(default)
+
+    def lin_map_saturating(x, good, bad):
+        """
+        Maps x to a score in [0,1] where:
+          - x <= good  => score ~= 1
+          - x >= bad   => score ~= 0
+          - linear in between
+        """
+        if bad <= good:
+            return 1.0 if x <= good else 0.0
+        if x <= good:
+            return 1.0
+        if x >= bad:
+            return 0.0
+        return 1.0 - (x - good) / (bad - good)
+
+    # Desired speed (km/h)
+    DESIRED_SPD = 25.0
+    # Overspeed tolerance factor (20% over desired before counting as overspeed)
+    OVERSPEED_TOL = 1.20
+    OVERSPEED_THR = DESIRED_SPD * OVERSPEED_TOL
+    # Consider "stopped" if below this speed
+    STOP_KMH = 1.0
+
+    # Pull episode data from self (provided by the environment)
+    speeds_kmh = list(self.speeds_kmh) if hasattr(self, "speeds_kmh") else []
+    steer_log  = list(self.steerings)  if hasattr(self, "steerings")  else []
+    pos_log    = list(self.positions)  if hasattr(self, "positions")  else []
+    steps      = int(getattr(self, "total_steps", 0))
+    max_steps  = int(getattr(self, "max_steps", max(steps, 1)))
+    collided   = bool(getattr(self.collision_flag, "get", lambda k, d=None: False)("flag", False) if hasattr(self, "collision_flag") else False)
+    if hasattr(self, "collision_flag") and isinstance(self.collision_flag, dict):
+        collided = bool(self.collision_flag.get("flag", False))
+    num_red_viol = int(getattr(self, "num_red_violations", 0))
+    loop_done    = bool(getattr(self, "done_path", False))
+
+    # Convert to numpy arrays for vectorized ops
+    spd = np.asarray(speeds_kmh, dtype=np.float32) if len(speeds_kmh) > 0 else np.zeros((0,), dtype=np.float32)
+    ste = np.asarray(steer_log,  dtype=np.float32) if len(steer_log)  > 0 else np.zeros((0,), dtype=np.float32)
+    pos = np.asarray(pos_log,    dtype=np.float32) if len(pos_log)    > 0 else np.zeros((0,2), dtype=np.float32)
+
+    # Basic scalars
+    avg_speed = float(np.mean(spd)) if spd.size > 0 else 0.0
+    med_speed = float(np.median(spd)) if spd.size > 0 else 0.0
+    pct_time_stopped = float(np.mean(spd < STOP_KMH)) if spd.size > 0 else 1.0
+
+    # Overspeed fraction (time spent > overspeed threshold)
+    overspeed_ratio_time = float(np.mean(spd > OVERSPEED_THR)) if spd.size > 0 else 0.0
+
+    # Distance traveled (meters) from positions log
+    dist_travelled_m = 0.0
+    if pos.shape[0] >= 2:
+        diffs = pos[1:] - pos[:-1]
+        seg_len = np.linalg.norm(diffs, axis=1)
+        dist_travelled_m = float(np.sum(seg_len))
+
+    # Speed tracking quality (mean absolute error around desired speed)
+    if spd.size > 0:
+        mae_speed = float(np.mean(np.abs(spd - DESIRED_SPD)))
+    else:
+        mae_speed = DESIRED_SPD
+
+    # Smoothness proxies
+    # - Longitudinal smoothness via mean |Δspeed| per control step (km/h per step)
+    if spd.size >= 2:
+        d_spd = np.abs(np.diff(spd))
+        mean_d_spd = float(np.mean(d_spd))
+        # Hard brake proxy: large negative changes (use raw diff to dete
+--- end_source_preview ---
+EASY:
+  episode_file: ep_000.json
+  fitness: 0.865194
+  metrics: avg_speed_kmh:11.785712, collision:0, compliance_score:1, desired_speed_kmh:25, dist_travelled_m:585.978638, efficiency_score:0.328641, hard_brake_frac:0.004747, max_steps:8000, mean_delta_speed_kmh_per_step:0.165728, mean_delta_steer_per_step:0.003757, median_speed_kmh:1.007653, num_red_violations:0, overspeed_ratio_time:0, overspeed_threshold_kmh:30, path_completed:1, pct_time_stopped:0.5, safety_score:0.998813, smoothness_score:1, speed_mae_kmh:13.262812, steps:3582, total_fitness:0.865194
+HARD:
+  episodes: 3
+  episode_files: [ep_000.json, ep_001.json, ep_002.json]
+  fitness_per_episode: [0.109838, 0.109838, 0.094878]
+  metrics_per_episode:
+    avg_speed_kmh: [22.543055, 22.54323, 10.589171]
+    collision: [1, 1, 1]
+    compliance_score: [1, 1, 1]
+    desired_speed_kmh: [25, 25, 25]
+    dist_travelled_m: [75.001205, 75.002838, 173.253922]
+    efficiency_score: [0.44676, 0.446762, 0.147561]
+    hard_brake_frac: [0, 0, 0.003396]
+    max_steps: [8000, 8000, 8000]
+    mean_delta_speed_kmh_per_step: [0.311294, 0.311119, 0.15743]
+    mean_delta_steer_per_step: [0.000045, 0.000021, 0.000091]
+    median_speed_kmh: [24.408676, 24.408676, 0.000002]
+    num_red_violations: [0, 0, 0]
+    overspeed_ratio_time: [0, 0, 0]
+    overspeed_threshold_kmh: [30, 30, 30]
+    path_completed: [0, 0, 0]
+    pct_time_stopped: [0.045833, 0.045833, 0.547922]
+    safety_score: [0, 0, 0]
+    smoothness_score: [1, 1, 1]
+    speed_mae_kmh: [2.575176, 2.575001, 14.459947]
+    steps: [240, 240, 1179]
+    total_fitness: [0.109838, 0.109838, 0.094878]
+
+=== Fitness Function 011 ===
+source_preview:
+def fitness_function():
+    """
+    Fitness function to evaluate a CARLA driving episode.
+    It returns a scalar fitness in [0,1] and a detailed metrics dictionary.
+
+    Integration note:
+    - This function expects to be called at the end of `run_episode`.
+    - It requires access to the environment object that holds episode logs (positions, speeds, steerings, etc.).
+    - To work with the provided simulator (which calls `fitness_score()`), this file also defines `fitness_score()`
+      as a thin alias to `fitness_function()`.
+
+    Data it uses (expected as attributes on the environment object):
+      - self.positions:  [(x,y), ...] per step
+      - self.speeds_kmh: [km/h, ...] per step
+      - self.steerings:  [steer, ...] per step in [-1,1]
+      - self.total_steps: int
+      - self.num_red_violations: int
+      - self.collision_flag: {"flag": bool}
+      - self.collision_ids: set (will be added to metrics by caller)
+      - self.done_path: bool (True if loop completed)
+      - Optional: self.L (route length in meters) if available
+    """
+    # Helper to locate the environment object at runtime without extra imports.
+    # It tries common variable names in globals; if not found, it raises a clear error.
+    def _resolve_env():
+        # Preferred: a global 'current_env' or 'ENV' pointing to the object
+        for name in ("current_env", "ENV", "env", "ENV_LAST"):
+            if name in globals():
+                obj = globals()[name]
+                # basic sanity check for expected attributes
+                if hasattr(obj, "positions") and hasattr(obj, "speeds_kmh") and hasattr(obj, "steerings"):
+                    return obj
+        # Fallback: scan globals for an object with the expected attributes
+        for _, obj in globals().items():
+            try:
+                if hasattr(obj, "positions") and hasattr(obj, "speeds_kmh") and hasattr(obj, "steerings"):
+                    return obj
+            except Exception:
+                continue
+        raise RuntimeError(
+            "fitness_function() could not locate the environment object. "
+            "Define a global variable (e.g., current_env = self) before calling."
+        )
+
+    import math
+    import numpy as np
+
+    env = _resolve_env()
+
+    # Extract episode data with robust defaults
+    positions = np.array(env.positions, dtype=np.float32) if getattr(env, "positions", None) else np.zeros((0, 2), dtype=np.float32)
+    speeds_kmh = np.array(env.speeds_kmh, dtype=np.float32) if getattr(env, "speeds_kmh", None) else np.zeros((0,), dtype=np.float32)
+    steerings = np.array(env.steerings, dtype=np.float32) if getattr(env, "steerings", None) else np.zeros((0,), dtype=np.float32)
+    total_steps = int(getattr(env, "total_steps", len(speeds_kmh)))
+    num_red = int(getattr(env, "num_red_violations", 0))
+    collided = bool(getattr(env, "collision_flag", {}).get("flag", False))
+    done_path = bool(getattr(env, "done_path", False))
+    route_len_m = float(getattr(env, "L", 0.0)) if hasattr(env, "L") else 0.0
+
+    # Basic derived arrays
+    n = int(speeds_kmh.shape[0])
+    speeds_mps = speeds_kmh / 3.6
+    # Distance traveled (path length from logged positions)
+    if positions.shape[0] >= 2:
+        diffs_xy = positions[1:] - positions[:-1]
+        step_dist = np.sqrt(np.sum(diffs_xy * diffs_xy, axis=1))
+        dist_travelled_m = float(np.sum(step_dist))
+    else:
+        dist_travelled_m = 0.0
+
+    # Route completion/progress estimation
+    if route_len_m > 1e-6:
+        progress_ratio = min(1.0, dist_travelled_m / route_len_m)
+    else:
+        # If route length not available, approximate by whether the path loop was marked complete
+        progress_ratio = 1.0 if done_path else (0.0 if dist_travelled_m <= 1e-3 else 0.5)
+    if done_path:
+        progress_ratio = 1.0  # trust the explicit completion flag
+
+    # Movement and speed stats
+    avg_speed_kmh = float(np.mean(speeds_kmh)) if n > 0 else 0.0
+    desired_kmh = 25.0
+    # Speed tracking (MAE around de
+--- end_source_preview ---
+EASY:
+  episode_file: ep_000.json
+  fitness: 0.929103
+  metrics: avg_speed_kmh:11.796692, collided:0, compliance_score:1, desired_speed_kmh:25, distance_travelled_m:586.177002, efficiency_score:0.793984, frac_hard_brake_steps:0.004471, jerk_rms_dv_mps_per_tick:0.113104, moving_ratio:0.5, num_hard_brakes:16, num_red_violations:0, pct_over_25:0.125419, pct_over_35:0, pct_over_45:0, pct_time_stopped:0.5, progress_ratio:1, route_len_m:592.081665, safety_collision:1, safety_hard_brake:0.955295, safety_overspeed:1, safety_score:0.993294, smoothness_score:0.890831, speed_mae_kmh:13.251951, speed_track_score:0.469922, steer_avg_abs_rate:0.004004, total_fitness:0.929103
+HARD:
+  episodes: 3
+  episode_files: [ep_000.json, ep_001.json, ep_002.json]
+  fitness_per_episode: [0.05627, 0.057505, 0.058832]
+  metrics_per_episode:
+    avg_speed_kmh: [14.155619, 22.535727, 21.562883]
+    collided: [1, 1, 1]
+    compliance_score: [1, 1, 1]
+    desired_speed_kmh: [25, 25, 25]
+    distance_travelled_m: [173.464432, 74.671265, 174.162415]
+    efficiency_score: [0.409446, 0.445801, 0.532022]
+    frac_hard_brake_steps: [0.004535, 0, 0.006885]
+    jerk_rms_dv_mps_per_tick: [0.124466, 0.123351, 0.153937]
+    moving_ratio: [0.604757, 0.953975, 0.919244]
+    num_hard_brakes: [4, 0, 4]
+    num_red_violations: [0, 0, 0]
+    pct_over_25: [0.151755, 0.251046, 0.235395]
+    pct_over_35: [0, 0, 0]
+    pct_over_45: [0, 0, 0]
+    pct_time_stopped: [0.395243, 0.046025, 0.080756]
+    progress_ratio: [0.292974, 0.126116, 0.294153]
+    route_len_m: [592.081665, 592.081665, 592.081665]
+    safety_collision: [0, 0, 0]
+    safety_hard_brake: [0.954649, 1, 0.931153]
+    safety_overspeed: [1, 1, 1]
+    safety_score: [0.393197, 0.4, 0.389673]
+    smoothness_score: [0.889358, 0.890634, 0.866443]
+    speed_mae_kmh: [10.911162, 2.582996, 3.539742]
+    speed_track_score: [0.563554, 0.89668, 0.85841]
+    steer_avg_abs_rate: [0.00023, 0.000026, 0.000531]
+    total_fitness: [0.05627, 0.057505, 0.058832]
+
+=== Fitness Function 012 ===
+source_preview:
+def fitness_function(positions,
+                     speeds_kmh,
+                     steerings,
+                     num_red_violations,
+                     collision_flag,
+                     done_path,
+                     loop_length_m,
+                     max_steps,
+                     total_steps,
+                     desired_speed_kmh=25.0):
+    """
+    Compute fitness and sub-metrics for a CARLA driving episode.
+
+    Inputs (must be available in run_episode scope):
+      - positions: list of (x,y) tuples accumulated each tick (meters, world frame)
+      - speeds_kmh: list of ego speeds (km/h) per tick
+      - steerings: list of applied steering values per tick in [-1, 1]
+      - num_red_violations: int count of red-light violations during episode
+      - collision_flag: bool or dict with key "flag" indicating if a collision happened
+      - done_path: bool indicating if the loop was completed successfully
+      - loop_length_m: float total loop length in meters (self.L)
+      - max_steps: int maximum allowed steps for the episode
+      - total_steps: int number of steps actually taken
+      - desired_speed_kmh: float target cruise speed; default 25 km/h
+
+    Returns:
+      - total_fitness: float in [0,1] (higher is better)
+      - metrics: dict of interpretable sub-metrics (end_reason and collided_with_ids are appended by caller)
+    """
+    import math
+    import numpy as np
+
+    # ---------- Safe parsing and arrays ----------
+    collided = bool(collision_flag["flag"]) if isinstance(collision_flag, dict) else bool(collision_flag)
+
+    pos_arr = np.array(positions, dtype=np.float32) if positions else np.zeros((0, 2), dtype=np.float32)
+    spd = np.array(speeds_kmh, dtype=np.float32) if len(speeds_kmh) > 0 else np.zeros((0,), dtype=np.float32)
+    steer = np.array(steerings, dtype=np.float32) if len(steerings) > 0 else np.zeros((0,), dtype=np.float32)
+
+    n = int(spd.shape[0])
+    n_diff = max(n - 1, 1)
+
+    # ---------- Progress / distance ----------
+    # Distance traveled along the episode path (may slightly exceed centerline due to weaving).
+    if pos_arr.shape[0] >= 2:
+        seg = pos_arr[1:] - pos_arr[:-1]
+        seg_dist = np.linalg.norm(seg, axis=1)
+        dist_traveled_m = float(np.sum(seg_dist))
+    else:
+        dist_traveled_m = 0.0
+
+    loop_len = float(loop_length_m) if (loop_length_m is not None and loop_length_m > 1e-6) else max(dist_traveled_m, 1.0)
+    progress_frac = min(1.0, dist_traveled_m / loop_len)
+
+    # If the path loop was completed, force progress to 1.0
+    if done_path:
+        progress_frac = 1.0
+
+    # ---------- Speed tracking and efficiency ----------
+    if n > 0:
+        mean_speed = float(np.mean(spd))
+        speed_mae = float(np.mean(np.abs(spd - desired_speed_kmh)))
+        # Comfortable band: within ±5 km/h of desired (20–30 km/h when desired=25)
+        in_band = np.logical_and(spd >= (desired_speed_kmh - 5.0), spd <= (desired_speed_kmh + 5.0))
+        frac_in_band = float(np.mean(in_band))
+        idle_frac = float(np.mean(spd < 1.0))
+        overspeed_frac_35 = float(np.mean(spd > 35.0))
+        overspeed_frac_45 = float(np.mean(spd > 45.0))
+    else:
+        mean_speed = 0.0
+        speed_mae = desired_speed_kmh
+        frac_in_band = 0.0
+        idle_frac = 1.0
+        overspeed_frac_35 = 0.0
+        overspeed_frac_45 = 0.0
+
+    # Speed tracking score: 1 when close to desired, declines as MAE grows.
+    # Normalize by 15 km/h to avoid over-penalizing minor deviations.
+    speed_track_score = max(0.0, 1.0 - min(1.0, speed_mae / 15.0))
+
+    # Additional penalty for persistent overspeeding:
+    # We combine mild (>35) and severe (>45) overspeed fractions.
+    overspeed_penalty = min(0.9, 0.6 * overspeed_frac_35 + 0.9 * overspeed_frac_45)
+    speed_score = max(0.0, speed_track_score * (1.0 - overspeed_penalty))
+
+    # ---------- Smoothness (steer + longitudinal) ----------
+    if steer.shape[0] >= 2:
+        dsteer = np.abs(steer[1:] - steer[:-1])
+        mean_abs_dst
+--- end_source_preview ---
+EASY:
+  episode_file: ep_000.json
+  fitness: 0.935798
+  metrics: collided:0, distance_traveled_m:585.978638, idle_frac:0.5, idling_score:0, loop_length_m:592.081665, mean_abs_dspeed_kmh:0.165728, mean_abs_steer_rate:0.003757, mean_speed_kmh:11.785712, no_collision_score:1, num_red_violations:0, overspeed_frac:0, overspeed_score:1, overspeed_threshold_kmh:33.75, redlight_score:1, route_completion:1, smoothness_score:0.962987, speed_mae_kmh:1.441609, speed_smoothness:0.944757, speed_tracking_score:0.942336, steer_smoothness:0.981216, total_fitness:0.935798, total_steps:3582
+HARD:
+  episodes: 3
+  episode_files: [ep_000.json, ep_001.json, ep_002.json]
+  fitness_per_episode: [0.504089, 0.497165, 0.503968]
+  metrics_per_episode:
+    collided: [1, 1, 1]
+    distance_traveled_m: [74.997849, 174.52179, 75.002327]
+    idle_frac: [0.045833, 0.474045, 0.045833]
+    idling_score: [0.908333, 0.05191, 0.908333]
+    loop_length_m: [592.081665, 592.081665, 592.081665]
+    mean_abs_dspeed_kmh: [0.307169, 0.182686, 0.311147]
+    mean_abs_steer_rate: [0.000034, 0.000363, 0.000024]
+    mean_speed_kmh: [22.54336, 12.316385, 22.543201]
+    no_collision_score: [0, 0, 0]
+    num_red_violations: [0, 0, 0]
+    overspeed_frac: [0, 0, 0]
+    overspeed_score: [1, 1, 1]
+    overspeed_threshold_kmh: [33.75, 33.75, 33.75]
+    redlight_score: [1, 1, 1]
+    route_completion: [0.126668, 0.29476, 0.126676]
+    smoothness_score: [0.94872, 0.968646, 0.948082]
+    speed_mae_kmh: [1.494935, 1.613273, 1.499384]
+    speed_smoothness: [0.89761, 0.939105, 0.896284]
+    speed_tracking_score: [0.940203, 0.935469, 0.940025]
+    steer_smoothness: [0.99983, 0.998187, 0.999881]
+    total_fitness: [0.504089, 0.497165, 0.503968]
+    total_steps: [240, 1021, 240]
+
+=== Fitness Function 013 ===
+source_preview:
+import math
+import numpy as np
+
+def fitness_score():
+    """
+    Computes a scalar fitness in [0,1] and a dictionary of interpretable sub-metrics
+    using data collected during the episode.
+    Assumptions:
+    - This function is called at the end of run_episode(), where `self` has the following:
+        self.positions:      list[(x,y)] world coordinates in meters
+        self.steerings:      list[float] steering values in [-1,1]
+        self.speeds_kmh:     list[float] instantaneous speed in km/h
+        self.total_steps:    int number of control steps taken
+        self.max_steps:      int maximum steps allowed
+        self.collision_flag: dict with key "flag" -> bool
+        self.collision_ids:  set of collided actor IDs
+        self.num_red_violations: int red-light violations detected
+        self.done_path:      bool whether loop was completed (success condition)
+        self.L:              float loop length in meters (if available)
+    - Desired cruise speed is 25 km/h.
+    - Emphasis: safety, efficiency, smoothness, and rule compliance.
+    Notes:
+    - All operations are robust to empty logs.
+    """
+    # -----------------------------
+    # Constants and targets
+    # -----------------------------
+    TARGET_SPD_KMH = 25.0
+    # Soft overspeed threshold: 35% above target
+    OVERSPEED_KMH  = TARGET_SPD_KMH * 1.35  # ≈ 33.75 km/h
+
+    # Smoothness normalization constants (tuned for CARLA fixed-step control)
+    # Max per-step steer change considered "acceptable"
+    STEER_DELTA_REF = 0.20  # 20% of full steering range per step on average
+    # Max per-step speed change considered "acceptable"
+    SPEED_DELTA_REF = 3.0   # 3 km/h per step on average
+
+    # Idle threshold
+    IDLE_KMH = 1.0
+
+    # -----------------------------
+    # Fetch episode logs
+    # -----------------------------
+    positions = getattr(self, "positions", []) or []
+    steerings = getattr(self, "steerings", []) or []
+    speeds_kmh = getattr(self, "speeds_kmh", []) or []
+    collided = bool(getattr(self, "collision_flag", {"flag": False}).get("flag", False))
+    red_viol = int(getattr(self, "num_red_violations", 0))
+    done_path = bool(getattr(self, "done_path", False))
+    total_steps = int(getattr(self, "total_steps", 0))
+    loop_length_m = float(getattr(self, "L", 0.0))
+
+    # Convert to arrays
+    pos_arr = np.array(positions, dtype=np.float32) if len(positions) > 0 else np.zeros((0,2), dtype=np.float32)
+    steer_arr = np.array(steerings, dtype=np.float32) if len(steerings) > 0 else np.zeros((0,), dtype=np.float32)
+    spd_arr = np.array(speeds_kmh, dtype=np.float32) if len(speeds_kmh) > 0 else np.zeros((0,), dtype=np.float32)
+
+    # -----------------------------
+    # Distance traveled (efficiency / progress proxy)
+    # -----------------------------
+    if pos_arr.shape[0] >= 2:
+        diffs = np.diff(pos_arr, axis=0)
+        step_dists = np.linalg.norm(diffs, axis=1)
+        dist_traveled_m = float(np.sum(step_dists))
+    else:
+        dist_traveled_m = 0.0
+
+    # Route completion proxy
+    if loop_length_m > 1e-6:
+        route_completion = min(1.0, dist_traveled_m / loop_length_m) if not done_path else 1.0
+    else:
+        # If loop length unknown, use done_path only
+        route_completion = 1.0 if done_path else 0.0
+
+    # -----------------------------
+    # Speed statistics
+    # -----------------------------
+    mean_speed_kmh = float(np.mean(spd_arr)) if spd_arr.size > 0 else 0.0
+    # Only evaluate speed tracking when moving (avoid penalizing mandated stops excessively)
+    moving_mask = spd_arr > 2.0
+    if np.any(moving_mask):
+        mae_kmh = float(np.mean(np.abs(spd_arr[moving_mask] - TARGET_SPD_KMH)))
+    else:
+        # If never moved, treat as maximal deviation from target
+        mae_kmh = TARGET_SPD_KMH
+
+    # Speed tracking score: 1 - normalized MAE
+    speed_tracking_score = max(0.0, 1.0 - (mae_kmh / max(TARGET_SPD_KMH, 1e-6)))
+
+    # Overspeed fraction
+    overspeed_frac = float(np.mean(spd_arr > OVERSPEED_KMH)
+--- end_source_preview ---
+EASY:
+  episode_file: ep_000.json
+  fitness: 0.961329
+  metrics: avg_speed_kmh:11.789399, collision:0, compliance_score:1, dist_travel_m:586.167236, efficiency_score:0.862175, hard_brake_count:0, hard_steer_count:0, idle_frac:0.499721, jerk_rms_mps_per_step2:0.062951, loop_length_m:592.081665, num_red_violations:0, overspeed_frac:0, overspeed_mean_excess_kmh:0, progress_frac:1, safety_score:1, smoothness_score:0.971903, speed_rmse_moving_kmh:3.156773, steer_rate_rms_per_step:0.017303, total_fitness:0.961329
+HARD:
+  episodes: 2
+  episode_files: [ep_000.json, ep_001.json]
+  fitness_per_episode: [0, 0]
+  metrics_per_episode:
+    avg_speed_kmh: [22.522123, 22.542025]
+    collision: [1, 1]
+    compliance_score: [1, 1]
+    dist_travel_m: [73.997925, 74.996719]
+    efficiency_score: [0.514603, 0.515796]
+    hard_brake_count: [0, 0]
+    hard_steer_count: [0, 0]
+    idle_frac: [0.046414, 0.045833]
+    jerk_rms_mps_per_step2: [0.072097, 0.070768]
+    loop_length_m: [592.081665, 592.081665]
+    num_red_violations: [0, 0]
+    overspeed_frac: [0, 0]
+    overspeed_mean_excess_kmh: [0, 0]
+    progress_frac: [0.124979, 0.126666]
+    safety_score: [0, 0]
+    smoothness_score: [0.981884, 0.982233]
+    speed_rmse_moving_kmh: [3.216994, 3.197526]
+    steer_rate_rms_per_step: [0.000129, 0.000106]
+    total_fitness: [0, 0]

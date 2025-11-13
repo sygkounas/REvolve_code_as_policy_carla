@@ -1,0 +1,208 @@
+SYSTEM:
+You are an autonomous-driving engineer tasked with designing a high-quality **fitness function** that evaluates a CARLA driving episode.  
+Your function must reflect realistic autonomous-driving goals: safety, efficiency, smoothness, and rule compliance. The desired speed is 25kmh.
+You should return both a **scalar total fitness ∈ [0, 1]** (higher = better) and a dictionary of interpretable sub-metrics.  
+The function must be written as valid, standalone Python code that can be inserted into the simulator.  
+Use only built-in libraries (`math`, `numpy`) and include clear inline comments explaining your logic.  
+The input of the fitness function needs to be in the scope of run episode but you are free to add your own variables if needed.
+USER:
+Below is the simulator loop.  It shows what data are available each episode and where your function will be called.  
+At the end of an episode, the simulator will call your function to compute the overall performance of the driving policy and alongisde with the metrics
+def run_episode(self):
+        """Runs until loop complete / collision / timeout. Returns (success_bool, fitness_float, metrics_dict)."""
+        spec = self.world.get_spectator()
+        start_time = time.time()
+
+        while True:
+            self._tick()
+
+            # Chase cam (optional)
+            ego_tf = self.ego.get_transform()
+            spec_tf = carla.Transform(
+                ego_tf.location + carla.Location(z=30.0) + ego_tf.get_forward_vector() * -12.0,
+                carla.Rotation(pitch=-50.0, yaw=ego_tf.rotation.yaw)
+            )
+            spec.set_transform(spec_tf)
+            pos = np.array([ego_tf.location.x, ego_tf.location.y], dtype=np.float32)
+            v = self.ego.get_velocity()
+            speed = math.hypot(v.x, v.y)
+
+            if self.policy_fn is None:
+                raise RuntimeError("No policy loaded. Call env.load_policy('your_policy.txt') before run_episode().")
+
+            # Build obs BEFORE choosing the next control (no one-step delay)
+            obs = self.get_obs(self._last_control)
+
+            steer, throttle, brake = self.policy_fn(obs)
+
+            # clamp & sanitize
+            steer    = float(max(-1.0, min(1.0, steer)))
+            throttle = float(max(0.0,  min(1.0, throttle)))
+            brake    = float(max(0.0,  min(1.0, brake)))
+
+            control = carla.VehicleControl(steer=steer, throttle=throttle, brake=brake)
+            self.ego.apply_control(control)
+            self._last_control = control
+
+            # logs
+            self.total_steps += 1
+            self.positions.append((ego_tf.location.x, ego_tf.location.y))
+            self.steerings.append(float(control.steer))
+            v = self.ego.get_velocity()
+            speed_mps = math.sqrt(v.x*v.x + v.y*v.y + v.z*v.z)
+            spd_kmh = 3.6 * speed_mps
+            self.speeds_kmh.append(spd_kmh)
+            for idx, (gx, gy) in self.gate_xy.items():
+                dist_gate = math.hypot(pos[0] - gx, pos[1] - gy)
+                now_in_gate = (dist_gate <= TL_GATE_RADIUS_M)
+                if now_in_gate and not self._in_gate_prev[idx] and speed > 0.5:
+                    st = tl_state_str(self.world, self.tl_actor_map.get(idx))
+                    if st == "Red":
+                        self.num_red_violations += 1
+                        print(f"[TL VIOLATION] crossed TL-{idx} on RED")
+                self._in_gate_prev[idx] = now_in_gate
+
+            # harder pedestrians: periodic retargets (cooldown + TTL + side-hit guard)
+            if self.harder_peds and (time.time() - self.last_ped_retarget) >= self.ped_cross_every_s:
+                now = time.time()
+
+                # --- state dicts (create if missing; minimal change) ---
+                if not hasattr(self, "_ped_ready_at"):      self._ped_ready_at = {}
+                if not hasattr(self, "_ped_lane_enter_at"): self._ped_lane_enter_at = {}
+                if not hasattr(self, "_ped_offlane_at"):    self._ped_offlane_at = {}
+                if not hasattr(self, "_ped_last_goal_xy"):  self._ped_last_goal_xy = {}
+
+                # ensure dwell knob exists (minimal default if not in __init__)
+                if not hasattr(self, "ped_offlane_dwell_s"):
+                    self.ped_offlane_dwell_s = 2.5
+
+                # --- ego once ---
+                ego_tf = self.ego.get_transform()
+                pos = np.array([ego_tf.location.x, ego_tf.location.y], dtype=np.float32)
+                yaw_rad = math.radians(ego_tf.rotation.yaw)
+                R_we = rot_world_to_ego(yaw_rad)
+                v = self.ego.get_velocity()
+                ego_speed = math.hypot(v.x, v.y)
+
+                # send goal only if changed > tol (prevents controller thrash)
+                def _send_goal_once(wid, ctrl, wloc, target_xy, vmin=1.2, vmax=2.0, tol=0.35):
+                    last = self._ped_last_goal_xy.get(wid)
+                    if last is not None:
+                        dx = target_xy[0] - last[0]; dy = target_xy[1] - last[1]
+                        if (dx*dx + dy*dy) <= (tol*tol):
+                            return False
+                    ctrl.go_to_location(carla.Location(x=float(target_xy[0]), y=float(target_xy[1]), z=wloc.z))
+                    ctrl.set_max_speed(random.uniform(vmin, vmax))
+                    self._ped_last_goal_xy[wid] = (float(target_xy[0]), float(target_xy[1]))
+                    return True
+
+                # debug counters
+                c_inlane = c_retreat = c_cross = c_skipped = c_exitlean = 0
+
+                for walker, ctrl in self.ped_pairs:
+                    try:
+                        if not walker or not walker.is_alive:  continue
+                        if not ctrl   or not ctrl.is_alive:    continue
+
+                        wloc = walker.get_location()
+                        pxy  = np.array([wloc.x, wloc.y], dtype=np.float32)
+                        s_w, lat_w, k, t, proj_xy = project_point_onto_loop(
+                            pxy, self.A, self.AB, self.seg_len, self.s_before
+                        )
+
+                        # ---------- TTL: if inside lane too long, keep pushing out until they EXIT (no premature clear) ----------
+                        if abs(lat_w) <= LANE_HALF:
+                            c_inlane += 1
+                            enter_at = self._ped_lane_enter_at.get(walker.id)
+                            if enter_at is None:
+                                self._ped_lane_enter_at[walker.id] = now
+                            else:
+                                if (now - enter_at) >= self.ped_lane_ttl_s:
+                                    seg = self.AB[k]; Ls = float(np.linalg.norm(seg))
+                                    if Ls > 1e-6:
+                                        n = np.array([-seg[1]/Ls, seg[0]/Ls], dtype=np.float32)
+                                        sign_dir = 1.0 if lat_w >= 0.0 else -1.0
+                                        target = proj_xy + sign_dir * n * max(self.ped_offlane_offset_m, LANE_HALF + 2.0)
+                                        if _send_goal_once(walker.id, ctrl, wloc, (float(target[0]), float(target[1])), vmin=1.2, vmax=1.6):
+                                            c_retreat += 1
+                                            cd = random.uniform(self.ped_cooldown_min_s, self.ped_cooldown_max_s)
+                                            self._ped_ready_at[walker.id] = now + cd
+                                           # print(f"[RETREAT] wid={walker.id} inlane_for={now-enter_at:.2f}s tgt=({target[0]:.2f},{target[1]:.2f})")
+                                    # IMPORTANT: do NOT clear _ped_lane_enter_at here; we keep timing until they truly exit
+                            # when inside lane we skip cross logic this tick
+                            continue
+                        else:
+                            # they are OFF-lane now → record off-lane start (dwell) and clear in-lane timer once
+                            if walker.id in self._ped_lane_enter_at and self._ped_lane_enter_at[walker.id] is not None:
+                                self._ped_offlane_at[walker.id] = now
+                             #   print(f"[EXIT-LANE] wid={walker.id} after {now - self._ped_lane_enter_at[walker.id]:.2f}s in-lane")
+                                c_exitlean += 1
+                            if walker.id in self._ped_lane_enter_at and self._ped_lane_enter_at[walker.id] is not None:
+                                self._ped_offlane_at[walker.id] = now
+                            #    print(f"[EXIT-LANE] wid={walker.id} after {now - self._ped_lane_enter_at[walker.id]:.2f}s in-lane")
+#
+                            # clear the in-lane timer
+                            if walker.id in self._ped_lane_enter_at:
+                                self._ped_lane_enter_at[walker.id] = None
+
+                            # ensure an initial off-lane timestamp exists (for walkers that never entered yet)
+                            if walker.id not in self._ped_offlane_at:
+                                self._ped_offlane_at[walker.id] = now
+
+                        # ---------- side-hit guard: don't step into nearly stopped ego hugging laterally ----------
+                        p_rel_e = R_we @ (pxy - pos)
+                        if ego_speed <= 1.0 and abs(p_rel_e[1]) <= 1.5:
+                            c_skipped += 1
+                            continue
+
+                        # ---------- CROSS TRIGGER: require cooldown + off-lane dwell + start from curb band ----------
+                        ready_at  = self._ped_ready_at.get(walker.id, 0.0)
+                        t_off = self._ped_offlane_at.get(walker.id, now)   # default=now ⇒ off_since=0 if unknown
+                        off_since = 0.0 if t_off is None else (now - t_off)
+                        in_start_band = (abs(lat_w) >= (LANE_HALF + 0.5))  # start from sidewalk/curb, not edge
+
+                        if (now >= ready_at) and in_start_band and (off_since >= self.ped_offlane_dwell_s) and (random.random() < self.ped_cross_prob):
+                            tx, ty = ped_cross_target_for(wloc, self.path_xy, self.ped_cross_offset_m)
+                            if _send_goal_once(walker.id, ctrl, wloc, (tx, ty), vmin=1.2, vmax=1.6):
+                                c_cross += 1
+                                cd = random.uniform(self.ped_cooldown_min_s, self.ped_cooldown_max_s)
+                                self._ped_ready_at[walker.id] = now + cd
+                           #     print(f"[CROSS] wid={walker.id} off_since={off_since:.2f}s lat={lat_w:.2f} prob={self.ped_cross_prob}")
+
+                    except Exception:
+                        continue
+
+             #   print(f"[HARDPEDS] inlane={c_inlane} retreat={c_retreat} exitlane={c_exitlean} cross={c_cross} skipped={c_skipped}")
+                self.last_ped_retarget = now
+
+            # termination checks
+            if self.collision_flag["flag"]:
+                end_reason = "collision"; break
+            if self.total_steps >= self.max_steps:
+                end_reason = "timeout"; break
+
+            tf = self.ego.get_transform()
+            pos = np.array([tf.location.x, tf.location.y], dtype=np.float32)
+            s_now, *_ = project_point_onto_loop(pos, self.A, self.AB, self.seg_len, self.s_before)
+            prog_m   = wrap_forward_progress(s_now, self.s0, self.L)
+            prog_frac = prog_m / max(self.L, 1e-6)
+            dist_to_start = float(np.linalg.norm(pos - self.first_pt))
+            if (dist_to_start <= self.start_tol_m) and (prog_frac >= self.start_gate_frac):
+                end_reason = "loop_complete"
+                self.done_path = True
+                break
+
+        pos_arr = np.array(self.positions, dtype=np.float32) if self.positions else np.zeros((0,2), dtype=np.float32)
+        fit, metrics = fitness_score() # your logic here
+        metrics["end_reason"] = end_reason
+        metrics["collided_with_ids"] = list(self.collision_ids)
+        success = bool(self.done_path and not self.collision_flag["flag"])
+        return success, float(fit), metrics
+
+
+In metrics you always need to append these: metrics["end_reason"] = end_reason, metrics["collided_with_ids"] = list(self.collision_ids)
+So, follow the instructions and provide a fitness fucntion with the follwingng format:
+def fitness_function(): # you should provide analytically whichever variables you use inside the fitness funtion input
+    # Your logic here
+    ...
+    return total_fitness, metrics
