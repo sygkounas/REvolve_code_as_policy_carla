@@ -1,0 +1,1082 @@
+You are an intelligent autonomous driver environment designer using the Carla simulator. Your job is to steadily increase the difficulty of the environment each iteration while keeping it solvable. 
+Difficulty should grow gradually, never jumping to extremes.”. The task for the car is to drive from start to goal position without colliding, while respecting traffic lights and pedestrians. Your tas is to make it harder each time.
+You are provided the following class that you need to modify as said:
+Do NOT repeat or copy the same task. Always extend from the previous one by making it incrementally more challenging in a balanced way.
+You are given aslo the following score {Actual Score} of the policy distrubution perfromance with 1 beig perfect and 0 the oppoiste. Higher score indicates easier environment and good policy performance.
+```python
+# ------------------------ Small helpers ------------------------
+LANE_HALF = 2.0
+LANE_MARGIN = 1.0
+PED_LAT_RIGHT   = 3.0   # extend +1 m for sidewalk
+PED_LAT_LEFT    = -3.0  # extend -1 m past left lane edge
+PED_INLANE_EPS    = 0.5
+PED_APPROACH_BAND = 3.0
+LAT_V_MIN         = 0.20
+CROSS_HORIZON_S   = 8.0
+PED_DS_MAX        = 50                 # meters ahead for pedestrians snapshot
+SAFE_DISTANCE_CONST = 50.0             # look-ahead for lead car
+TL_WINDOW_AHEAD_M   = 50.0
+TL_GATE_RADIUS_M    = 2.5
+HIST_LEN            = 4
+OPP_LANE_LEFT  = -6.0      # far edge of opposite lane
+OPP_LANE_RIGHT = -2.0      # near edge of opposite lane (left edge of ego lane)
+
+
+class CarlaTown01Env:
+    """
+    Town01 ENV:
+    - __init__: stores config (no argparse), loads path.
+    - reset(seed): reloads world, randomizes episode (spawn points, counts, behaviors).
+    - run_episode(): runs until loop complete / collision / timeout. Returns (success, fitness, metrics).
+    - cleanup(): removes actors, turns off sync.
+
+    Extendable: add new difficulty knobs in-place.
+    """
+
+    def __init__(self,
+                 host="localhost",
+                 port=2000,
+                 tm_port=8000,
+                 town="Town01",
+                 path_file="recorded_path_cleaned.txt",
+                 policy_path: Optional[str] = None,   # <-- add default
+                 sync=True, fps=20,
+                 target_kmh=25.0,
+                 num_vehicles=8, num_peds=50,
+                 global_plan_step=10,
+                 start_tol_m=2.0, start_gate_frac=0.90,
+                 save_plan_file="extracted_path.txt",
+                 harder_cars=False, ignore_light_pct=0, lane_change_pct=50,
+                 speed_diff_mean=10.0, min_follow_dist=6.0,
+                 harder_peds=False, ped_cross_prob=0.25,
+                 ped_cross_every_s=6.0, ped_cross_offset_m=8.0,
+                 ref_steps=2200, max_steps=8000,
+                 jitter_ratio=0.15):
+        # --- Config (no argparse) ---
+        self.host = host
+        self.port = int(port)
+        self.tm_port_req = int(tm_port)
+        self.town = town
+        self.path_file = path_file
+
+        self.sync = bool(sync)
+        self.fps = int(fps)
+        self.policy_path=policy_path
+        self.load_policy(policy_path)
+        
+
+        self.target_kmh = float(target_kmh)
+        self.num_vehicles = int(num_vehicles)
+        self.num_peds = int(num_peds)
+        self.global_plan_step = int(global_plan_step)
+        self.max_steps= int(max_steps)
+
+        self.start_tol_m = float(start_tol_m)
+        self.start_gate_frac = float(start_gate_frac)
+
+        self.save_plan_file = save_plan_file
+
+        self.harder_cars = bool(harder_cars)
+        self.ignore_light_pct = int(ignore_light_pct)
+        self.lane_change_pct = int(lane_change_pct)
+        self.speed_diff_mean = float(speed_diff_mean)
+        self.min_follow_dist = float(min_follow_dist)
+
+        self.harder_peds = bool(harder_peds)
+        self.ped_cross_prob = float(ped_cross_prob)
+        self.ped_cross_every_s = float(ped_cross_every_s)
+        self.ped_cross_offset_m = float(ped_cross_offset_m)
+
+        self.ref_steps = int(ref_steps)
+        self.jitter_ratio = float(jitter_ratio)
+
+        # --- Static data ---
+        self.path_xy = load_path(self.path_file)
+        self.A, self.B, self.AB, self.seg_len, self.s_before, self.L = precompute_loop_segments(self.path_xy)
+        self.first_pt = self.path_xy[0]
+
+        # --- Runtime vars (set in reset) ---
+        self.client: Optional[carla.Client] = None
+        self.world: Optional[carla.World] = None
+        self.bp_lib = None
+        self.tm: Optional[carla.TrafficManager] = None
+        self.tm_port_used: Optional[int] = None
+
+        self.ego: Optional[carla.Actor] = None
+      #  self.agent: Optional[BasicAgent] = None
+        self.col_sensor: Optional[carla.Actor] = None
+
+        self.vehicles: List[carla.Actor] = []
+        self.walkers: List[carla.Actor] = []
+        self.walker_ctrls: List[carla.Actor] = []
+        self.ped_pairs: List[Tuple[carla.Actor, carla.Actor]] = []
+
+        self.all_actors: List[carla.Actor] = []
+
+        self.collision_flag = {"flag": False}
+        self.num_red_violations = 0  # placeholder hook
+
+        # Logs per episode
+        self.positions: List[Tuple[float, float]] = []
+        self.steerings: List[float] = []
+        self.speeds_kmh: List[float] = []
+        self.total_steps = 0
+        self.done_path = False
+        # --- Pedestrian behavior knobs (hard but solvable) ---
+        self.ped_cooldown_min_s   = 15.0  # min seconds before the same walker can be re-targeted
+        self.ped_cooldown_max_s   = 30.0  # max seconds before the same walker can be re-targeted
+        self.ped_lane_ttl_s       = 4.0   # fail-safe: if a walker stays inside the lane > TTL, force it off-lane
+        self.ped_offlane_offset_m = 5.0   # lateral push (≈ sidewalk) when forcing off-lane
+        self._ped_ready_at = {}       # wid -> unix time when re-targeting is allowed again
+        self._ped_lane_enter_at = {}  # wid -> unix time of first detection inside lane; cleared when they leave
+
+
+        self.s0 = 0.0
+        self.last_ped_retarget = 0.0
+        self.spawn_points_xy = [
+            (150.000, 133.437, 0.5),(0,0,0.5),  # start
+        ]
+        self.obs_speed_hist      = deque([0.0]*HIST_LEN, maxlen=HIST_LEN)
+        self.obs_lateral_hist    = deque([0.0]*HIST_LEN, maxlen=HIST_LEN)
+        self.obs_yaw_err_hist    = deque([0.0]*HIST_LEN, maxlen=HIST_LEN)
+        self.obs_steer_hist      = deque([0.0]*HIST_LEN, maxlen=HIST_LEN)
+        self.obs_throttle_hist   = deque([0.0]*HIST_LEN, maxlen=HIST_LEN)
+        self.obs_brake_hist      = deque([0.0]*HIST_LEN, maxlen=HIST_LEN)
+        self._lat_ema = None
+        self._last_control = None  # updated in run_episode (or pass into get_obs)
+        # TL mapping per episode
+        self.tl_actor_map = {}
+        self.s_light = {}
+        self.gate_xy = {}
+        self._in_gate_prev = {}
+        self.pace_real_time = True
+        self._last_tick_time = None
+        self.collision_ids = [] 
+        
+    def load_policy(self, policy_file: str):
+        """
+        Load a Python policy from a .txt/.py file.
+        Supports either:
+        - a function:  def policy(obs): return steer, throttle, brake
+        - a class:     class Policy: ... with def compute_action(self, obs, path)
+        """
+        code = Path(policy_file).read_text()
+        ns = {}
+        exec(code, ns, ns)
+
+        if "policy" in ns and callable(ns["policy"]):
+            # plain function case
+            self.policy_fn = ns["policy"]
+
+        elif "Policy" in ns and callable(ns["Policy"]):
+            # class case: wrap compute_action
+            inst = ns["Policy"]()
+            if hasattr(inst, "compute_action") and callable(inst.compute_action):
+                self.policy_fn = lambda obs: inst.compute_action(obs, None)
+            else:
+                raise RuntimeError("Policy class must define a 'compute_action(obs, path)' method.")
+
+        else:
+            raise RuntimeError("Policy file must define either a function 'policy(obs)' or a class 'Policy' with 'compute_action'.")
+
+
+    # ---------- Core: reset/run/cleanup ----------
+    def reset(self, seed: Optional[int] = None, save_plan_on_ep0: bool = False, ep_index: int = 0):
+        """(Re)load world, set sync, spawn ego/traffic/peds, build plan, set agent & progress zero."""
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+
+        # Clean previous episode
+        self.cleanup(silent=True)
+
+        # Connect + TM
+        self.client = carla.Client(self.host, self.port)
+        self.client.set_timeout(60.0)
+       # self.world = self.client.load_world(self.town)
+        #if self.world is None:
+        self.world = self.client.load_world(self.town)  # load only once
+         #   print("loading world!")
+        #else:
+         #   self.world = self.client.get_world()  # reuse existing map
+
+        self.bp_lib = self.world.get_blueprint_library()
+        self.tm, self.tm_port_used = get_tm_with_fallback(self.client, start_port=self.tm_port_req)
+
+        # Sync mode
+        self._set_sync(self.sync, self.fps)
+        import time
+        self._last_tick_time = time.perf_counter()
+
+        # Spawn ego near a random path start candidate (adds episode randomness)
+        self.ego = self._spawn_ego_from_list(index=0)
+        self.all_actors.append(self.ego)
+        if self.sync:
+            self.world.tick()
+        else:
+            self.world.wait_for_tick()
+        ego_tf = self.ego.get_transform()
+        loc = ego_tf.location
+        print(f"[RESET] Ego spawned at x={loc.x:.2f}, y={loc.y:.2f}, z={loc.z:.2f}")
+        self._ped_last_positions = {}
+
+        # Collision sensor
+        self.col_sensor = self._add_collision_sensor(self.ego, self._on_collision)
+        self.all_actors.append(self.col_sensor)
+
+        # Vehicles
+        veh_count = max(0, int(round(self.num_vehicles * (1.0 + self._jitter()))))
+        self.vehicles = self._spawn_traffic(veh_count)
+        self.all_actors.extend(self.vehicles)
+        if self.harder_cars and self.vehicles:
+            self._configure_harder_cars(self.vehicles)
+
+        # Pedestrians (batch) + pair (walker,controller)
+        ped_count = max(0, int(round(self.num_peds * (1.0 + self._jitter()))))
+        walker_ids, ctrl_ids = self._spawn_pedestrians_batch(ped_count)
+        self.walkers = [self.world.get_actor(wid) for wid in walker_ids if self.world.get_actor(wid)]
+        self.walker_ctrls = [self.world.get_actor(cid) for cid in ctrl_ids if self.world.get_actor(cid)]
+        self.ped_pairs = list(zip(self.walkers, self.walker_ctrls))
+        self.all_actors.extend(self.walkers)
+        if self.sync:
+            self.world.tick()
+
+        # Build global plan from path waypoints
+        self.plan = self._build_global_plan(self.global_plan_step)
+        if not self.plan:
+            raise RuntimeError("Global plan is empty. Check your path/town.")
+        # Save plan once (ep 0) unless you want every episode saved
+        if save_plan_on_ep0 and ep_index == 0:
+            self._save_plan_to_txt(self.plan, self.save_plan_file)
+            print(f"[PLAN] Saved {len(self.plan)} waypoints to {self.save_plan_file}")
+
+        # Agent
+        #self.agent = BasicAgent(self.ego, target_speed=float(self.target_kmh))
+       # self.agent.set_global_plan(self.plan)
+
+        # Start progress s0 at actual spawn
+        start_loc = self.ego.get_transform().location
+        self.s0, *_ = project_point_onto_loop(
+            np.array([start_loc.x, start_loc.y], dtype=np.float32),
+            self.A, self.AB, self.seg_len, self.s_before
+        )
+
+        # Reset logs
+        self.positions, self.steerings, self.speeds_kmh = [], [], []
+        self.total_steps = 0
+        self.done_path = False
+        self.collision_flag["flag"] = False
+        self.collision_ids = []
+        self.num_red_violations = 0
+        self.last_ped_retarget = time.time()
+        self.tl_actor_map = map_known_lights_to_actors(self.world, search_radius=25.0)
+        self.s_light, self.gate_xy = {}, {}
+        for idx, (lx, ly) in KNOWN_TL.items():
+            pos = np.array([lx, ly], dtype=np.float32)
+            s_i, _, _, _, proj_xy = project_point_onto_loop(pos, self.A, self.AB, self.seg_len, self.s_before)
+            self.s_light[idx] = float(s_i)
+            self.gate_xy[idx] = (float(proj_xy[0]), float(proj_xy[1]))
+        self._in_gate_prev = {idx: False for idx in KNOWN_TL}
+        self._ped_ready_at = {}
+        self._ped_lane_enter_at = {}
+        # ---- Clear OBS histories ----
+        self.obs_speed_hist      = deque([0.0]*HIST_LEN, maxlen=HIST_LEN)
+        self.obs_lateral_hist    = deque([0.0]*HIST_LEN, maxlen=HIST_LEN)
+        self.obs_yaw_err_hist    = deque([0.0]*HIST_LEN, maxlen=HIST_LEN)
+        self.obs_steer_hist      = deque([0.0]*HIST_LEN, maxlen=HIST_LEN)
+        self.obs_throttle_hist   = deque([0.0]*HIST_LEN, maxlen=HIST_LEN)
+        self.obs_brake_hist      = deque([0.0]*HIST_LEN, maxlen=HIST_LEN)
+        self._lat_ema = None
+        self._last_control = None
+
+    def get_obs(self, control: Optional[carla.VehicleControl] = None) -> dict:
+        """
+        Build an observation dict matching inference.py 'slim OBS' + extensions:
+        - ego scalars: speed_mps, yaw_rate_rps
+        - histories len=4: speed/lateral/yaw_error/steer/throttle/brake
+        - snapshots:
+            * traffic_light
+            * lead_cars (top-2 in ego lane), opposite_cars (top-2 in opposite lane)
+            * pedestrians (both lanes; inference-style states for our lane, symmetric info for opposite)
+        """
+        if self.ego is None:
+            return {}
+
+        # ---- Ego state ----
+        tf = self.ego.get_transform()
+        pos = np.array([tf.location.x, tf.location.y], dtype=np.float32)
+        yaw_rad = math.radians(tf.rotation.yaw)
+        vel = self.ego.get_velocity()
+        acc = self.ego.get_acceleration()
+        ang = self.ego.get_angular_velocity()   # deg/s in CARLA
+        yaw_rate = math.radians(ang.z)          # rad/s
+       # print("yaw rate from ang.z",yaw_rate)
+
+        v_w = np.array([vel.x, vel.y], dtype=np.float32)
+        speed = float(np.linalg.norm(v_w))
+
+        # Frenet & lateral / yaw error on path
+        s_now, lateral, k_near, _, _proj_xy = project_point_onto_loop(
+            pos, self.A, self.AB, self.seg_len, self.s_before
+        )
+        tangent = self.AB[k_near] / (np.linalg.norm(self.AB[k_near]) + 1e-9)
+        path_yaw = math.atan2(tangent[1], tangent[0])
+# right-positive heading error: + means the car is rotated to the right of path
+        yaw_error = ((yaw_rad - path_yaw + math.pi) % (2*math.pi)) - math.pi
+     #   yaw_error = ((path_yaw - yaw_rad + math.pi) % (2*math.pi)) - math.pi
+
+
+       # yaw_error= -yaw_error
+        # EMA smooth lateral (like inference)
+        if self._lat_ema is None:
+            self._lat_ema = lateral
+        self._lat_ema = 0.2 * lateral + 0.8 * self._lat_ema
+        lateral_out = self._lat_ema  #
+
+
+        # Control (use provided, else last known, else zeros)
+        ctrl = control if control is not None else self._last_control
+        steer    = float(getattr(ctrl, "steer", 0.0) if ctrl else 0.0)
+        throttle = float(getattr(ctrl, "throttle", 0.0) if ctrl else 0.0)
+        brake    = float(getattr(ctrl, "brake", 0.0) if ctrl else 0.0)
+
+        # Update histories (len=4)
+        self.obs_speed_hist.append(speed)
+        self.obs_lateral_hist.append(lateral_out)
+        self.obs_yaw_err_hist.append(yaw_error)
+        self.obs_steer_hist.append(steer)
+        self.obs_throttle_hist.append(throttle)
+        self.obs_brake_hist.append(brake)
+
+        # World→ego rotation
+        R_we = rot_world_to_ego(yaw_rad)
+
+        # ---- Traffic light snapshot (active selection) ----
+        tl_active_idx = None
+        tl_active_dist = None
+        tl_active_state = "Unknown"
+        for idx, (lx, ly) in KNOWN_TL.items():
+            gx, gy = self.gate_xy[idx]
+            dist_gate = math.hypot(pos[0] - gx, pos[1] - gy)
+            s_gate = self.s_light[idx]
+            ds = (s_gate - s_now) % self.L
+            if 0.0 <= ds <= TL_WINDOW_AHEAD_M:
+                tl_active_idx = idx
+                tl_active_dist = dist_gate
+                tl_active_state = tl_state_str(self.world, self.tl_actor_map.get(idx))
+                break  # first gate ahead in window
+
+        tl_obs = {"exists": False, "state": None}
+        if tl_active_idx is not None:
+            tl_obs = {
+                "exists": True,
+                "dist_m": None if tl_active_dist is None else round(float(tl_active_dist), 2),
+                "state": tl_active_state,
+            }
+
+        # ---- Vehicles snapshot: top-2 lead cars (ego lane) + top-2 opposite-lane cars ----
+        ego_candidates: List[dict] = []
+        opp_candidates: List[dict] = []
+        lead_cars: List[dict] = []
+        opposite_cars: List[dict] = []
+
+        for v in self.world.get_actors().filter("vehicle*"):
+            if v.id == self.ego.id:
+                continue
+
+            pl = v.get_transform().location
+            pxy = np.array([pl.x, pl.y], dtype=np.float32)
+
+            # use path arclength window first
+            s_v, lat_v = frenet_s_lat(pxy, self.A, self.AB, self.seg_len, self.s_before)
+            ds = (s_v - s_now) % self.L
+            if ds <= 0.0 or ds > SAFE_DISTANCE_CONST:
+                continue  # only forward and within look-ahead
+
+            # must be physically in front in ego frame
+            p_rel_e = R_we @ (pxy - pos)
+            if p_rel_e[0] <= 0.0:
+                continue
+
+            vv = v.get_velocity()
+            v2 = np.array([vv.x, vv.y], dtype=np.float32)
+            v_rel_e = R_we @ (v2 - v_w)
+
+            gap_long_m   = float(p_rel_e[0])
+            gap_lat_m = float(p_rel_e[1])
+            rel_long_mps = float(v_rel_e[0])
+
+            # ---- LEAD CARS ----
+            if -LANE_HALF <= lat_v <= LANE_HALF:
+                ttc_s = ttc_longitudinal(gap_long_m, rel_long_mps, cap=20.0)
+                thw_s = (gap_long_m / max(0.5, speed)) if gap_long_m > 0 else None
+                cand = {
+                    "gap_long_m": round(gap_long_m, 2),
+                    "gap_lat_m":  round(gap_lat_m, 2),
+                    "rel_long_mps": round(rel_long_mps, 2),
+                    "ttc_s": None if ttc_s is None else round(ttc_s, 2),
+                    "thw_s": None if thw_s is None else round(thw_s, 2),
+                    "_sort_key": gap_long_m,
+                }
+                ego_candidates.append(cand)
+
+            # ---- OPPOSITE CARS ----
+            elif OPP_LANE_LEFT <= lat_v < OPP_LANE_RIGHT:
+                t_conflict_s = ttc_conflict(gap_long_m, rel_long_mps, cap=20.0)
+                cand = {
+                    "gap_long_m": round(gap_long_m, 2),
+                    "gap_lat_m":  round(gap_lat_m, 2),
+                    "rel_long_mps": round(rel_long_mps, 2),
+                    "t_conflict_s": None if t_conflict_s is None else round(t_conflict_s, 2),
+                    "_sort_key": gap_long_m,
+                }
+                opp_candidates.append(cand)
+
+
+        #     ttc_s        = ttc_longitudinal(gap_long_m, rel_long_mps, cap=20.0)
+        #     thw_s        = (gap_long_m / max(0.5, speed)) if gap_long_m > 0 else None
+
+        #     cand = {
+        #         "gap_long_m": round(gap_long_m, 2),
+        #         "gap_lat_m":  round(gap_lat_m, 2),
+        #         "rel_long_mps": round(rel_long_mps, 2),
+        #         "ttc_s": None if ttc_s is None else round(ttc_s, 2),
+        #         "thw_s": None if thw_s is None else round(thw_s, 2),
+        #        # "lat_frenet_m": round(float(lat_v), 2),  # right-positive for policy/debug
+        #    #     "_sort_key": gap_long_m,
+        #     }
+
+        #     # Lane band classification via Frenet lateral
+        #     if -LANE_HALF <= lat_v <= LANE_HALF:                  # ego lane [-2, +2]
+        #         ego_candidates.append(cand)
+        #     elif OPP_LANE_LEFT <= lat_v < OPP_LANE_RIGHT:         # opposite lane [-6, -2)
+        #         opp_candidates.append(cand)
+        #     # else: ignore vehicles outside the two 4m lanes
+
+        if ego_candidates:
+            ego_candidates.sort(key=lambda d: d["_sort_key"])
+            lead_cars = [{k: v for k, v in d.items() if k != "_sort_key"}  # strip helper
+                        for d in ego_candidates[:MAX_LEAD_VEHICLES]]
+
+        if opp_candidates:
+            opp_candidates.sort(key=lambda d: d["_sort_key"])
+            opposite_cars = [{k: v for k, v in d.items() if k != "_sort_key"}
+                            for d in opp_candidates[:MAX_OPPOSITE_VEHICLES]]
+       
+
+        # ---- Pedestrians snapshot list (both lanes) ----
+        ped_list: List[dict] = []
+#    #     print(f"[PED DEBUG] total pedestrians in world = {len(all_peds)}")
+#         if     not hasattr(self, "_ped_last_positions"):
+#             self._ped_last_positions = {}
+        dt = self.world.get_settings().fixed_delta_seconds or 0.05
+
+        for p in self.world.get_actors().filter("walker.pedestrian*"):
+            pl  = p.get_transform().location
+            pxy = np.array([pl.x, pl.y], dtype=np.float32)
+
+            # forward along-path window (use path arclength, same as before)
+            s_p, _ = frenet_s_lat(pxy, self.A, self.AB, self.seg_len, self.s_before)
+            ds = (s_p - s_now) % self.L
+            if not (0.0 < ds <= PED_DS_MAX):
+                # if ds>50 and ds <75:
+                #     print(f"[PED DEBUG] skipped: ds={ds:.1f} > {PED_DS_MAX}")
+
+                continue
+
+            pv   = p.get_velocity()
+            pv2  = np.array([pv.x, pv.y], dtype=np.float32)
+            if np.allclose(pv2, 0.0):
+                # estimate velocity from last position
+                if p.id in self._ped_last_positions:
+                    prev = self._ped_last_positions[p.id]
+                    pv2 = (pxy - prev) / dt
+                  #  print(f"[PED DEBUG] using FD vel id={p.id}, v_est=({pv2[0]:.2f},{pv2[1]:.2f})")
+                else:
+                    #print(f"[PED DEBUG] vel=0, no history id={p.id}")
+                    pv2 = np.zeros_like(pxy)
+            else:
+                pass
+               # print(f"[PED RAW VEL] id={p.id} vel=({pv.x:.2f},{pv.y:.2f},{pv.z:.2f})")
+            self._ped_last_positions[p.id] = pxy
+
+            # ego-frame relative pos/vel
+            p_rel_e = R_we @ (pxy - pos)
+            v_rel_e = R_we @ (pv2 - v_w)
+
+            gap_long_m  = float(p_rel_e[0])
+            gap_lat_m   = float(p_rel_e[1])    # + = right, − = left
+            rel_lat_mps = float(v_rel_e[1])    # + = moving right
+
+
+            # 1) In-lane: [-2, +2]
+            if -LANE_HALF <= gap_lat_m <= LANE_HALF:
+              #  print(f"[PED DEBUG] in-lane detected at long={gap_long_m:.1f}, lat={gap_lat_m:.2f}")
+
+                ped_list.append({
+                    "lane": "ego",
+                    "state": "in_lane",
+                    "gap_long_m": round(gap_long_m, 2),
+                    "gap_lat_m":  round(gap_lat_m, 2),
+                    "rel_lat_mps": round(rel_lat_mps, 2),
+                    "t_enter_lane_s": 0.0,
+                    "side": "right" if gap_lat_m > 0 else ("left" if gap_lat_m < 0 else "center"),
+                })
+                continue
+
+            # 2) Approaching bands: [-3, -2) and (2, 3]
+            in_left_band  = (PED_LAT_LEFT  <= gap_lat_m < -LANE_HALF)
+            in_right_band = (LANE_HALF < gap_lat_m <= PED_LAT_RIGHT)
+            if in_left_band or in_right_band:
+                # must be moving toward the lane center (0): sign test + minimum speed
+                moving_toward = (rel_lat_mps * gap_lat_m) < 0.0 #and abs(rel_lat_mps) >= LAT_V_MIN
+                if not moving_toward:
+                   # print(f"[PED DEBUG] skipped: lat={gap_lat_m:.2f}, rel_lat={rel_lat_mps:.2f} not moving toward")
+                   # print(f"[PED RAW VEL] id={p.id} vel=({pv.x:.2f}, {pv.y:.2f}, {pv.z:.2f})")
+                    continue
+
+                # time-to-edge of our lane boundary
+                target_edge = (-LANE_HALF) if in_left_band else (LANE_HALF)
+                t_enter = _time_to_target_lat(target_edge, gap_lat_m, rel_lat_mps)
+                if (t_enter is None) or not (0.0 < t_enter <= CROSS_HORIZON_S):
+                  #  print(f"[PED DEBUG] skipped: t_enter={t_enter}")
+
+                    continue
+
+                ped_list.append({
+                    "lane": "approach",
+                    "state": "approaching_lane",
+                    "gap_long_m": round(gap_long_m, 2),
+                    "gap_lat_m":  round(gap_lat_m, 2),
+                    "rel_lat_mps": round(rel_lat_mps, 2),
+                    "t_enter_lane_s": round(t_enter, 2),
+                    "side": "right" if gap_lat_m > 0 else "left",
+                })
+
+        # ---- Final OBS dict ----
+        obs = {
+            "speed_mps": round(speed, 2),
+            "yaw_rate_rps": round(yaw_rate, 3),
+            "speed_hist4":        [round(x, 2) for x in list(self.obs_speed_hist)],
+            "lateral_hist4":      [round(x, 3) for x in list(self.obs_lateral_hist)],
+            "yaw_error_hist4":    [round(x, 3) for x in list(self.obs_yaw_err_hist)],
+            "steer_cmd_hist4":    [round(x, 3) for x in list(self.obs_steer_hist)],
+            "throttle_cmd_hist4": [round(x, 3) for x in list(self.obs_throttle_hist)],
+            "brake_cmd_hist4":    [round(x, 3) for x in list(self.obs_brake_hist)],
+            "traffic_light": tl_obs,
+            "lead_cars": lead_cars,           # top-2 in ego lane
+            "opposite_cars": opposite_cars,   # top-2 in opposite lane
+            "pedestrians": ped_list,
+        }
+        # print(f"[OBSCHK] lat_e={lateral_out:+.3f} yaw_e={yaw_error:+.3f} "
+        # f"-> right+  (steer sign: +right/-left)")
+
+        return obs
+
+
+
+
+    def run_episode(self):
+        """Runs until loop complete / collision / timeout. Returns (success_bool, fitness_float, metrics_dict)."""
+        spec = self.world.get_spectator()
+        start_time = time.time()
+
+        while True:
+            self._tick()
+
+            # Chase cam (optional)
+            ego_tf = self.ego.get_transform()
+            spec_tf = carla.Transform(
+                ego_tf.location + carla.Location(z=30.0) + ego_tf.get_forward_vector() * -12.0,
+                carla.Rotation(pitch=-50.0, yaw=ego_tf.rotation.yaw)
+            )
+            spec.set_transform(spec_tf)
+            pos = np.array([ego_tf.location.x, ego_tf.location.y], dtype=np.float32)
+            v = self.ego.get_velocity()
+            speed = math.hypot(v.x, v.y)
+
+            if self.policy_fn is None:
+                raise RuntimeError("No policy loaded. Call env.load_policy('your_policy.txt') before run_episode().")
+
+            # Build obs BEFORE choosing the next control (no one-step delay)
+            obs = self.get_obs(self._last_control)
+
+            steer, throttle, brake = self.policy_fn(obs)
+
+            # clamp & sanitize
+            steer    = float(max(-1.0, min(1.0, steer)))
+            throttle = float(max(0.0,  min(1.0, throttle)))
+            brake    = float(max(0.0,  min(1.0, brake)))
+
+            control = carla.VehicleControl(steer=steer, throttle=throttle, brake=brake)
+            self.ego.apply_control(control)
+            self._last_control = control
+
+            # logs
+            self.total_steps += 1
+            self.positions.append((ego_tf.location.x, ego_tf.location.y))
+            self.steerings.append(float(control.steer))
+            v = self.ego.get_velocity()
+            speed_mps = math.sqrt(v.x*v.x + v.y*v.y + v.z*v.z)
+            spd_kmh = 3.6 * speed_mps
+            self.speeds_kmh.append(spd_kmh)
+            for idx, (gx, gy) in self.gate_xy.items():
+                dist_gate = math.hypot(pos[0] - gx, pos[1] - gy)
+                now_in_gate = (dist_gate <= TL_GATE_RADIUS_M)
+                if now_in_gate and not self._in_gate_prev[idx] and speed > 0.5:
+                    st = tl_state_str(self.world, self.tl_actor_map.get(idx))
+                    if st == "Red":
+                        self.num_red_violations += 1
+                        print(f"[TL VIOLATION] crossed TL-{idx} on RED")
+                self._in_gate_prev[idx] = now_in_gate
+
+            # harder pedestrians: periodic retargets (cooldown + TTL + side-hit guard)
+            if self.harder_peds and (time.time() - self.last_ped_retarget) >= self.ped_cross_every_s:
+                now = time.time()
+                ego_tf = self.ego.get_transform()
+                pos = np.array([ego_tf.location.x, ego_tf.location.y], dtype=np.float32)
+                yaw_rad = math.radians(ego_tf.rotation.yaw)
+                R_we = rot_world_to_ego(yaw_rad)
+                v = self.ego.get_velocity()
+                ego_speed = math.hypot(v.x, v.y)
+
+                for walker, ctrl in self.ped_pairs:
+                    try:
+                        if not walker or not walker.is_alive:  continue
+                        if not ctrl   or not ctrl.is_alive:    continue
+
+                        wloc = walker.get_location()
+                        pxy  = np.array([wloc.x, wloc.y], dtype=np.float32)
+                        s_w, lat_w, k, t, proj_xy = project_point_onto_loop(
+                            pxy, self.A, self.AB, self.seg_len, self.s_before
+                        )
+
+                        # --- fail-safe TTL ---
+                        if abs(lat_w) <= LANE_HALF:
+                            enter_at = self._ped_lane_enter_at.get(walker.id)
+                            if enter_at is None:
+                                self._ped_lane_enter_at[walker.id] = now
+                            else:
+                                if (now - enter_at) >= self.ped_lane_ttl_s:
+                                    seg = self.AB[k]
+                                    Ls  = float(np.linalg.norm(seg))
+                                    if Ls > 1e-6:
+                                        n = np.array([-seg[1]/Ls, seg[0]/Ls], dtype=np.float32)
+                                        sign_dir = 1.0 if lat_w >= 0.0 else -1.0
+                                        target = proj_xy + sign_dir * n * self.ped_offlane_offset_m
+                                        ctrl.go_to_location(carla.Location(x=float(target[0]), y=float(target[1]), z=wloc.z))
+                                        ctrl.set_max_speed(random.uniform(1.2, 2.0))
+                                        cd = random.uniform(self.ped_cooldown_min_s, self.ped_cooldown_max_s)
+                                        self._ped_ready_at[walker.id] = now + cd
+                                        self._ped_lane_enter_at[walker.id] = None
+                                    continue
+                        else:
+                            if walker.id in self._ped_lane_enter_at:
+                                self._ped_lane_enter_at[walker.id] = None
+
+                        # --- side-hit guard: if ego nearly stopped and walker too close, skip ---
+                        p_rel_e = R_we @ (pxy - pos)
+                        if ego_speed <= 1 and abs(p_rel_e[1]) <= 1.5:
+                            continue
+
+                        # --- random re-target (cross) if out of cooldown ---
+                        ready_at = self._ped_ready_at.get(walker.id, 0.0)
+                        if now >= ready_at and (random.random() < self.ped_cross_prob):
+                            tx, ty = ped_cross_target_for(wloc, self.path_xy, self.ped_cross_offset_m)
+                            ctrl.go_to_location(carla.Location(x=tx, y=ty, z=wloc.z))
+                            ctrl.set_max_speed(random.uniform(1.2, 2.0))
+                            cd = random.uniform(self.ped_cooldown_min_s, self.ped_cooldown_max_s)
+                            self._ped_ready_at[walker.id] = now + cd
+
+                    except Exception:
+                        continue
+
+                self.last_ped_retarget = now
+
+            # termination checks
+            if self.collision_flag["flag"]:
+                end_reason = "collision"; break
+            if self.total_steps >= self.max_steps:
+                end_reason = "timeout"; break
+
+            tf = self.ego.get_transform()
+            pos = np.array([tf.location.x, tf.location.y], dtype=np.float32)
+            s_now, *_ = project_point_onto_loop(pos, self.A, self.AB, self.seg_len, self.s_before)
+            prog_m   = wrap_forward_progress(s_now, self.s0, self.L)
+            prog_frac = prog_m / max(self.L, 1e-6)
+            dist_to_start = float(np.linalg.norm(pos - self.first_pt))
+            if (dist_to_start <= self.start_tol_m) and (prog_frac >= self.start_gate_frac):
+                end_reason = "loop_complete"
+                self.done_path = True
+                break
+
+        pos_arr = np.array(self.positions, dtype=np.float32) if self.positions else np.zeros((0,2), dtype=np.float32)
+        fit, metrics = fitness_score(
+            self.path_xy, pos_arr, self.steerings, self.speeds_kmh,
+            total_steps=self.total_steps,
+            done_path=self.done_path,
+            collision=self.collision_flag["flag"],
+            num_red_violations=self.num_red_violations,
+            ref_steps=self.ref_steps,
+            min_moving_speed=2
+        )
+        metrics["end_reason"] = end_reason
+        metrics["collided_with_ids"] = list(self.collision_ids)
+        success = bool(self.done_path and not self.collision_flag["flag"])
+        return success, float(fit), metrics
+
+
+        # put this helper inside the class (anywhere before cleanup is fine)
+    def _destroy_ids(self, ids):
+        if not ids:
+            return
+        try:
+            self.client.apply_batch_sync([carla.command.DestroyActor(i) for i in ids], True)
+        except Exception:
+            pass
+
+    def cleanup(self, silent=False):
+        if not silent:
+            print("Cleaning up actors...")
+
+        # 1) stop async callbacks FIRST (sensors)
+        try:
+            if self.col_sensor:
+                try: self.col_sensor.stop()
+                except: pass
+        except: 
+            pass
+
+        # 2) stop walker controllers, then batch-destroy controllers
+        try:
+            existing_ctrl_ids = []
+            for c in list(self.walker_ctrls):
+                try:
+                    if c and self.world and self.world.get_actor(c.id):
+                        try: c.stop()             # may throw if already dead; ok
+                        except: pass
+                        existing_ctrl_ids.append(c.id)
+                except Exception:
+                    continue
+            self._destroy_ids(existing_ctrl_ids)
+        except Exception:
+            pass
+
+        # 3) batch-destroy the rest (walkers, vehicles, sensors, ego) from all_actors
+        try:
+            actor_ids = []
+            for a in list(self.all_actors):
+                try:
+                    if a and self.world and self.world.get_actor(a.id):
+                        actor_ids.append(a.id)
+                except Exception:
+                    continue
+            self._destroy_ids(actor_ids)
+        except Exception:
+            pass
+
+        # 4) turn off sync (last)
+        try:
+            if self.world:
+                self._set_sync(False, self.fps)
+        except Exception:
+            pass
+
+        if not silent:
+            print("Done.")
+
+        # 5) clear refs
+        self.vehicles = []
+        self.walkers = []
+        self.walker_ctrls = []
+        self.ped_pairs = []
+        self.all_actors = []
+        self.ego = self.agent = self.col_sensor = None
+
+
+    # ---------- Internals ----------
+    def _set_sync(self, sync: bool, fps: int):
+        settings = self.world.get_settings()
+        settings.synchronous_mode = bool(sync)
+        settings.fixed_delta_seconds = (1.0 / fps) if sync else None
+        self.world.apply_settings(settings)
+        if self.tm is not None:
+            self.tm.set_synchronous_mode(sync)
+
+    def _tick(self):
+        # advance one sim step
+        frame = self.world.tick() if self.sync else self.world.wait_for_tick()
+        # pace to wall-clock if requested
+        if self.sync and self.pace_real_time and self._last_tick_time is not None:
+            target_dt = 1.0 / max(1, self.fps)
+            now = time.perf_counter()
+            elapsed = now - self._last_tick_time
+            sleep_s = target_dt - elapsed
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            self._last_tick_time = time.perf_counter()
+        return frame
+
+
+    def _on_collision(self, evt):
+        other = evt.other_actor
+        impulse = evt.normal_impulse
+        print(f"[COLLISION] with {other.type_id} id={other.id}  impulse=({impulse.x:.2f},{impulse.y:.2f},{impulse.z:.2f})")
+        self.collision_flag["flag"] = True
+        try:
+            self.collision_ids.append(str(other.type_id))
+        except Exception:
+            pass
+
+
+    def _jitter(self):
+        return random.uniform(-self.jitter_ratio, self.jitter_ratio)
+
+    def _spawn_ego_from_list(self, index: int = 0) -> carla.Actor:
+        """Spawn ego at a predefined spawn point from self.spawn_points_xy list."""
+        car_bp = None
+        for cand in ["vehicle.tesla.model3", "vehicle.lincoln.mkz_2020", "vehicle.audi.a2"]:
+            try:
+                car_bp = self.bp_lib.find(cand); break
+            except Exception:
+                pass
+        if car_bp is None:
+            car_bp = random.choice(self.bp_lib.filter("vehicle.*"))
+
+        # pick spawn location from list
+        x, y, z = self.spawn_points_xy[index]
+        loc = carla.Location(x=x, y=y, z=z)
+        spawn_tf = carla.Transform(loc, carla.Rotation(yaw=0.0))
+
+        ego = self.world.try_spawn_actor(car_bp, spawn_tf)
+        if not ego:
+            raise RuntimeError(f"Failed to spawn ego at {self.spawn_points_xy[index]}")
+        return ego
+
+        
+
+    def _spawn_traffic(self, num_vehicles: int) -> List[carla.Actor]:
+        spawned = []
+        spawn_points = self.world.get_map().get_spawn_points()
+        random.shuffle(spawn_points)
+        for tf in spawn_points[:num_vehicles * 2]:
+            if len(spawned) >= num_vehicles:
+                break
+            candidates = [bp for bp in self.bp_lib.filter("vehicle.*")
+              if not any(x in bp.id for x in ["carlacola", "firetruck", "ambulance", "bus", "truck"])]
+            if not candidates:
+                return spawned
+            bp = random.choice(candidates)
+            veh = self.world.try_spawn_actor(bp, tf)
+            if veh is None:
+                continue
+            veh.set_autopilot(True, self.tm_port_used)
+            spawned.append(veh)
+        return spawned
+
+    def _configure_harder_cars(self, vehicles: List[carla.Actor]):
+        for v in vehicles:
+            try:
+                self.tm.auto_lane_change(v, True)
+                self.tm.random_left_lanechange_percentage(v, self.lane_change_pct)
+                self.tm.random_right_lanechange_percentage(v, self.lane_change_pct)
+                self.tm.ignore_lights_percentage(v, self.ignore_light_pct)
+                # TM: positive slows, negative speeds up
+                self.tm.vehicle_percentage_speed_difference(v, int(self.speed_diff_mean))
+                self.tm.distance_to_leading_vehicle(v, self.min_follow_dist)
+            except RuntimeError:
+                pass
+
+    def _spawn_pedestrians_batch(self, n: int):
+        # 1) Get once, modify, and keep the SAME list we will spawn from
+        walker_bps = list(self.bp_lib.filter("walker.pedestrian.*"))
+        for bp in walker_bps:
+            if bp.has_attribute("is_invincible"):
+                bp.set_attribute("is_invincible", "false")
+            if bp.has_attribute("role_name"):
+                bp.set_attribute("role_name", "pedestrian")
+        ctrl_bp = self.bp_lib.find("controller.ai.walker")
+
+        # 2) Pick spawn transforms on the navmesh
+        tfs = []
+        while len(tfs) < n:
+            loc = self.world.get_random_location_from_navigation()
+            if loc:
+                tfs.append(carla.Transform(loc))
+
+        # 3) Spawn walkers
+        batch = [carla.command.SpawnActor(random.choice(walker_bps), tf) for tf in tfs]
+        res = self.client.apply_batch_sync(batch, True)
+        walker_ids = [r.actor_id for r in res if not r.error]
+
+        # 4) IMPORTANT: enable physics on each walker so they collide with vehicles
+        for wid in walker_ids:
+            w = self.world.get_actor(wid)
+            if not w:
+                continue
+            try:
+                w.set_simulate_physics(True)     # <-- makes them solid / ragdoll on impact
+                w.enable_gravity(True)           # safe no-op if already True
+            except Exception:
+                pass
+
+        # 5) Spawn controllers and start them
+        batch2 = [carla.command.SpawnActor(ctrl_bp, carla.Transform(), wid) for wid in walker_ids]
+        res2 = self.client.apply_batch_sync(batch2, True)
+        ctrl_ids = [r.actor_id for r in res2 if not r.error]
+
+        # one tick to finalize spawns before starting controllers
+        self._tick()
+
+        speeds = [random.uniform(1.0, 1.6) for _ in ctrl_ids]
+        for cid, vmax in zip(ctrl_ids, speeds):
+            ctrl = self.world.get_actor(cid)
+            if not ctrl:
+                continue
+            try:
+                ctrl.start()
+                dest = self.world.get_random_location_from_navigation()
+                if dest:
+                    ctrl.go_to_location(dest)
+                ctrl.set_max_speed(float(vmax))
+            except Exception:
+                continue
+
+        return walker_ids, ctrl_ids
+
+
+    def _add_collision_sensor(self, parent: carla.Actor, callback_fn):
+        bp = self.bp_lib.find("sensor.other.collision")
+        sensor = self.world.spawn_actor(bp, carla.Transform(), attach_to=parent)
+        sensor.listen(callback_fn)
+        return sensor
+
+    def _build_global_plan(self, step: int = 10) -> List[Tuple[carla.Waypoint, RoadOption]]:
+        wmap = self.world.get_map()
+        plan: List[Tuple[carla.Waypoint, RoadOption]] = []
+        N = self.path_xy.shape[0]
+        step = max(1, step)
+        for i in range(0, N, step):
+            loc = carla.Location(x=float(self.path_xy[i, 0]), y=float(self.path_xy[i, 1]), z=0.0)
+            wp = wmap.get_waypoint(loc, project_to_road=True, lane_type=carla.LaneType.Driving)
+            if wp:
+                plan.append((wp, RoadOption.LANEFOLLOW))
+        loc_last = carla.Location(x=float(self.path_xy[-1, 0]), y=float(self.path_xy[-1, 1]), z=0.0)
+        wp_last = wmap.get_waypoint(loc_last, project_to_road=True, lane_type=carla.LaneType.Driving)
+        if wp_last:
+            plan.append((wp_last, RoadOption.LANEFOLLOW))
+        return plan
+
+    def _save_plan_to_txt(self, plan: List[Tuple[carla.Waypoint, RoadOption]], out_file: str):
+        with open(out_file, "w") as f:
+            for wp, _opt in plan:
+                loc = wp.transform.location
+                f.write(f"{loc.x:.3f} {loc.y:.3f}\n")
+
+# ------------------------ Main: run 25 episodes ------------------------
+from collections import defaultdict
+def main(policy_path, episodes=10):
+    out_root = "results"
+    policy_name = Path(policy_path).stem
+    save_dir = Path(out_root) / policy_name
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        env = CarlaTown01Env(
+            host="localhost",
+            port=2000,
+            tm_port=8010,
+            town="Town01",
+            path_file="recorded_path_cleaned.txt",
+            sync=True, fps=20,
+            target_kmh=25.0,
+            num_vehicles=8,
+            num_peds=50,
+            global_plan_step=1,
+            start_tol_m=2.0, start_gate_frac=0.90,
+            save_plan_file="extracted_path.txt",
+            harder_cars=False, ignore_light_pct=100, lane_change_pct=80, speed_diff_mean=15, min_follow_dist=4,
+            harder_peds=False, ped_cross_prob=0.9, ped_cross_every_s=1.0, ped_cross_offset_m=9.0,
+            ref_steps=2200,
+            jitter_ratio=0.15,
+            policy_path=policy_path
+        )
+
+        successes, fitnesses, all_metrics = 0, [], []
+        for ep in range(episodes):
+            print(f"\n=== {policy_name} | EP {ep+1}/{episodes} ===")
+            env.reset(seed=random.randint(0, 10**9), save_plan_on_ep0=(ep==0), ep_index=ep)
+            success, fit, metrics = env.run_episode()
+            metrics = clean_metrics(metrics, decimals=2)
+            print(f"end_reason={metrics.get('end_reason')} success={success} fit={fit:.4f}")
+            successes += int(success)
+            fitnesses.append(fit)
+            all_metrics.append(metrics)
+            env.cleanup(silent=False)
+
+        sr = successes / episodes
+        avg_fit = float(np.mean(fitnesses)) if fitnesses else 0.0
+
+        results = {
+            "policy": policy_name,
+            "success_rate": sr,
+            "avg_fitness": avg_fit,
+            "episodes": episodes,
+            "fitnesses": fitnesses,
+            "metrics_per_episode": all_metrics,
+        }
+
+    except Exception as e:
+        log_file = Path(out_root) / "errors.log"
+        with open(log_file, "a") as f:
+            f.write(f"{policy_name}: {repr(e)}\n")
+
+        results = {
+            "policy": policy_name,
+            "success_rate": 0.0,
+            "avg_fitness": 0.0,
+            "episodes": 0,
+            "fitnesses": [],
+            "metrics_per_episode": []
+        }
+
+    finally:
+        try:
+            env.cleanup(silent=False)
+        except Exception:
+            pass
+
+        with open(save_dir / "results.json", "w") as f:
+            json.dump(results, f, indent=2)
+
+        print(f"\n=== SUMMARY {policy_name} ===")
+        print(json.dumps(results, indent=2))
+
+    return results
+```
+CONTRACT (minimal & strict)
+- Output exactly ONE class named `CarlaTown01Env`. No top-level code or side effects (no prints/spawns/file I/O outside methods).
+- Do NOT modify or re-define the helper functions/constants shown above; treat them as read-only references. Use them, don’t edit them. 
+- You MAY add new helper methods and new difficulty knobs/parameters INSIDE the class (e.g., new timers, behaviors, sampling logic). You are NOT limited to changing numeric values.
+
+
+Rules:
+- You must not skip or delete any function that is already defined in the given class.
+- You are free to modify functions to make the environment harder, but you must not break the current logic or solvability. For example you cant block the street forever.
+-The evolution of the environment must be steady and cumulative. Each iteration should introduce a small, reasonable increase in difficulty (e.g. slightly denser traffic, more frequent pedestrians, more varied behaviors).
+ -Do not overshoot or make sudden spikes that render the task unrealistic or impossible.- The policy sees only the observation dictionary. If you add new sources of difficulty (e.g., more aggressive vehicles, jaywalking pedestrians), you must also extend `get_obs()` so the policy is aware of them (if needed).
+- Ego vehicle must always be `vehicle.tesla.model3`. Do not change this.
+- The start and goal positions are fixed, and the track is fixed.
+- Do not spawn oversized vehicles (e.g., buses, trucks) since they create unsolvable scenarios.
+- You must not force actors (vehicles, pedestrians) to intentionally collide with the ego; difficulty must arise naturally.
+- Maintain the side-hit guard: if ego speed ≤ 1 m/s and a pedestrian’s lateral offset in the ego frame satisfies |y| ≤ 1.5 m, do NOT retarget that pedestrian to cross into the car.
+- You must adjust `max_steps` appropriately:  
+  • The baseline track can be solved in ~2200 steps without traffic or pedestrians (or waiting red lights for the 4 traffic lights in total that the navigation path contains).  
+  • If you increase traffic/pedestrians, allow proportionally more steps, but never so many that idle driving trivially succeeds.  
+- You may add new helper methods and new difficulty knobs INSIDE the class (not just change numbers); you can modify logic in reset/run_episode/get_obs as needed while keeping solvability.
+- You MUST include `task_description(self) -> str` and update it each iteration to clearly summarize the current difficulty (traffic, pedestrians, lights, any new behaviors). Keep it HIGH-LEVEL (do not expose exact percentages/probabilities); it must match the actual environment logic. If you change something in the obs (i.e sensing value, etc) you need to state ti explicity in the task description.
+- Do not skip any function taht is being called or assume any functions t   hat dont given or coded explicity.
+Now give full env class CarlaTown01Env that obeys these rules:
+
+
+

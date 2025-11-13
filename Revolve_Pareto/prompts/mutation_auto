@@ -1,0 +1,58 @@
+You are given a policy-as-code for autonomous driving. 
+The policy receives observations and outputs actions `(steering, throttle, brake)`.  
+
+Example policy code:
+<Policy>
+
+
+It is evaluated over multiple test episodes. For each episode we compute the following metrics:
+
+- **progress**: fraction of the reference path completed [0–1].  
+- **lane_score**: path-following accuracy (higher = closer to lane center).  
+- **smooth_score**: steering smoothness (higher = less oscillation).  
+- **eff_score**: efficiency of completion (higher = finished quickly and smoothly).  
+- **collision**: True if the agent collided.  
+- **num_red_violations**: number of traffic light violations.  
+- **collision_pen / tl_pen / stationary_pen**: penalties applied if collisions, red-light violations, or long idle times occurred (0.50, 0.40, 0.50).  
+- **total_fitness**: the final fitness score for the episode (0 = worst, 1 = best). Combines all metrics and penalties.  
+- **end_reason**: why the episode ended (`"loop_complete"`, `"collision"`, or `"timeout"`).  
+- **collided_with_ids**: list of CARLA actor IDs/types the agent collided with (empty if no collision).  
+- **episodes**: number of evaluation episodes run for this policy.  
+- **fitness**: average `total_fitness` over all episodes, used as the overall score for the policy.  
+ 
+Penalties applied are fixed values:  
+- collision_pen = 0.50  
+- tl_pen = 0.40  
+- stationary_pen = 0.50  
+
+
+metrics from the two candidate policies:  
+<Metrics>
+
+(Parent scores: "fitness" == ΔHV over {lane, progress, smoothness, safety}.
+Safety per episode: safe_t = 1 if collision_t==0 AND num_red_violations_t==0 else 0;
+dataset safety = mean_t safe_t.)
+
+**Your task:**  
+Modify exactly one self-contained module of the policy that governs the car’s behavior.  
+The change should be substantive, altering logic or structure rather than simply adjusting a constant.  
+Keep all other parts of the function unchanged.  
+**Steps:**  
+1. Select a weak area in the current policy based on the metrics.
+2. Always output the entire `policy(obs)` function with its `compute_action(self, obs, path)` method, returning `(steering, throttle, brake)` inside exactly one fenced code block, using the format: 
+
+```python
+class Policy:
+    def __init__(...):
+        ...
+    def compute_action(self, obs, path):
+        return (steering, throttle, brake)
+```
+
+The code output should be formatted as a python code string: "```python ... ```".
+
+**Tips:**  
+- Make minimal changes: only mutate one clear aspect per iteration.
+- Target specific weaknesses (e.g. reduce collisions, improve lane keeping, smooth control).
+- Use only fields in `obs`.  
+- Do not introduce new input variables or extra arguments.

@@ -1,0 +1,94 @@
+ROLE
+You are an autonomous driving engineer. Write a deterministic code-as-policy controller for CARLA that follows the public API below and adheres to the observation semantics and sign conventions.
+
+API
+class Policy:
+    def __init__(self):
+        # initialize controller state
+        ...
+    def compute_action(self, obs, path):
+        """
+        obs: dict defined in OBSERVATION
+        path: np.ndarray (N,2), float32, lane-center polyline ordered along travel
+        return: (steering, throttle, brake) as floats
+        """
+
+CONSTRAINTS
+- steering in [-1, +1], throttle in [0, 1], brake in [0, 1]
+- never command throttle and brake simultaneously (if brake > 0 then throttle = 0)
+- deterministic (no randomness or learning)
+- smoothness: respect per-step rate limits; use the latest *_cmd_hist4 to bound changes
+- robust to missing/None/NaN; degrade conservatively rather than crash
+- no prints/logging
+
+SIGN CONVENTIONS (matches live OBS)
+- lateral_hist4: right-positive; + means ego is right of lane center (meters)
+- yaw_error_hist4: wrap(yaw_car - yaw_path) in (-pi, pi]; right-positive (clockwise)
+- yaw_rate_rps: right-positive (clockwise), radians per second
+- ego frame for snapshots: x forward, y right; so gap_lat_m > 0 = actor right of ego
+
+OBSERVATION (exact keys)
+Ego scalars:
+- speed_mps
+- yaw_rate_rps
+
+Ego histories (length 4, oldest→newest):
+- speed_hist4               # m/s
+- lateral_hist4             # right-positive meters (EMA of lateral error)
+- yaw_error_hist4           # right-positive radians
+- steer_cmd_hist4           # previous steering commands [-1,1]
+- throttle_cmd_hist4        # previous throttle commands [0,1]
+- brake_cmd_hist4           # previous brake commands [0,1]
+
+Traffic light (active gate ahead if any):
+- traffic_light: {
+    "exists": bool,
+    "state": "Red" | "Green" | "Unknown",   # Yellow is provided as Red upstream
+    "dist_m": float | None                  # Euclidean distance to gate
+  }
+
+Vehicles (lists, closest first, up to 2 each):
+- lead_cars: [
+    {
+      "gap_long_m": float,      # > 0 ahead
+      "gap_lat_m":  float,      # + right, - left (ego frame)
+      "rel_long_mps": float,    # (lead - ego) along ego-x
+      "ttc_s": float | None,    # if closing, else None
+      "thw_s": float | None,    # if gap_long_m > 0, else None
+    }, ...
+  ]
+- opposite_cars: [ same schema for oncoming-lane vehicles ]
+
+Pedestrians (lists):
+- pedestrians: [
+    {
+      "lane": "ego",
+      "state": "in_lane",
+      "gap_long_m": float, "gap_lat_m": float, "rel_lat_mps": float,
+      "t_enter_lane_s": 0.0, "side": "right" | "left" | "center"
+    },
+    {
+      "lane": "approach",
+      "state": "approaching_lane",
+      "gap_long_m": float, "gap_lat_m": float, "rel_lat_mps": float,
+      "t_enter_lane_s": float, "side": "right" | "left"
+    },
+    ...
+  ]
+Perception horizon:
+- All dynamic actors (vehicles and pedestrians) are provided only if within 35 m ahead of ego along the path; farther actors are omitted.
+
+
+OBJECTIVES (what to achieve)
+- lateral: minimize lateral and heading errors relative to lane centerline with bounded, smooth steering
+- longitudinal: track a smooth speed up to 6.94 m/s (25 km/h) when unimpeded
+- obey active red lights by decelerating smoothly and stopping with a safe margin before the stop line; never cross while Red.
+- yield to pedestrians that are already in the ego lane, and to approaching pedestrians if they are predicted to enter within a few seconds.
+- if a lead vehicle remains stopped for an extended time, the controller should not remain blocked indefinitely; only proceed if it is safe with respect to oncoming traffic.
+- precedence: red-light stop > pedestrian yielding > lead-vehicle following > cruising
+- fail-safe: on invalid or missing critical data, command a controlled stop (neutral steer tendency, throttle 0, nonzero brake)
+- comfort: avoid abrupt jerks or oscillations in commanded steering, throttle, or brake.
+- decisions about slowing or stopping should be based on feasible stop distance, time-to-collision, and precedence rules not solely on the fact that an actor appears at the perception horizon. Your policy should avoid overly conservative behavior.
+OUTPUT
+Return exactly one top-level class named Policy that implements the API and satisfies the constraints and objectives above.
+
