@@ -9,3 +9,6 @@ pip install -r requirements.txt
 The main evaluation loop is in loop.sh.
 It launches CARLA, runs each individual through main.py, and restarts the simulator between runs.
 bash loop.sh
+<p align="center">
+  <img src="media/carla_combined-1.png" width="700">
+</p>
