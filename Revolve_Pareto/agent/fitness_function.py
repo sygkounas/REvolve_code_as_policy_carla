@@ -294,15 +294,10 @@ def fitness_score(path, positions, steerings, speeds,
     else:
         avg_speed, recent_avg = 0.0, 0.0
 
-    if not done_path and recent_avg < 2.5:
-        stationary_pen = 0.5
-    elif progress < 0.05:
-        stationary_pen = 0.5
-    else:
-        stationary_pen = 0.0
+    
 
     # --- Final fitness ---
-    fitness = max(0.0, fitness - collision_pen - tl_pen - stationary_pen)
+    fitness = max(0.0, fitness - collision_pen - tl_pen )
 
 
     metrics = {
@@ -315,7 +310,6 @@ def fitness_score(path, positions, steerings, speeds,
       #  "avg_speed": avg_speed,
         "collision_pen": collision_pen,
         "tl_pen": tl_pen,
-        "stationary_pen": stationary_pen,
         "fitness": fitness,
         # add full deviation trace for analysis
      #   "lane_deviations": deviations,
