@@ -1,8 +1,4 @@
 <p align="center">
-  <img src="media/carla_combined-1.png" width="700">
-</p>
-
-<p align="center">
   <a href="media/Pareto_Policy.mp4">
     <img src="media/carla_combined-1.png" width="700">
   </a>
