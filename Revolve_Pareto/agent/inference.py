@@ -337,7 +337,7 @@ class CarlaTown01Env:
                  speed_diff_mean=10.0, min_follow_dist=6.0,
                  harder_peds=False, ped_cross_prob=0.25,
                  ped_cross_every_s=6.0, ped_cross_offset_m=8.0,
-                 ref_steps=6000, max_steps=12000,    
+                 ref_steps=6000, max_steps=10000,    
                  jitter_ratio=0.15):
         # --- Config (no argparse) ---
         self.host = host
@@ -1593,6 +1593,7 @@ def run_main(policy_path, episodes=10):
             pass
 
     return results, avg_fit
+
 
 
 
