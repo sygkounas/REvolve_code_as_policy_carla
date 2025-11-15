@@ -179,7 +179,6 @@ def main(cfg):
         # metrics_dicts = []
         policies = []
         load=0
-#       path_debug_policy_file=(r'/home/alkis/Downloads/carla/python_code/Revolve/database/revolve_auto/1/island_2/policies/1_0.txt')
 
         # for each generation, produce new individuals via mutation or crossover
         counter_env = os.environ.get("COUNTER")
