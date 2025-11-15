@@ -71,7 +71,7 @@ def _bootstrap_carla_paths():
     env_root = os.environ.get("CARLA_ROOT")
     if env_root:
         roots.append(Path(env_root))
-    roots += [Path("/home/alkis/CARLA"), Path("~/CARLA").expanduser()]
+    roots += [Path("/...CARLA"), Path("~/CARLA").expanduser()]
     for root in roots:
         pyapi = root / "PythonAPI"
         if not pyapi.exists():
@@ -325,7 +325,7 @@ class CarlaTown01Env:
                  port=2000,
                  tm_port=8000,
                  town="Town01",
-                 path_file="/home/alkis/Downloads/carla/python_code/Revolve/agent/recorded_path_cleaned.txt",
+                 path_file=".../agent/recorded_path_cleaned.txt",
                  policy_path: Optional[str] = None,   # <-- add default
                  sync=True, fps=20,
                  target_kmh=25.0,
@@ -1596,99 +1596,8 @@ def run_main(policy_path, episodes=10):
 
 
 
-# def run_inference(policy_path: str, n_episodes: int = 5):
-#     policy_name = Path(policy_path).stem
-#     island_dir = Path(policy_path).parents[1]   # .../island_X
-#     gen, counter = policy_name.split("_")
-#     save_dir = island_dir / f"{gen}_policy_{counter}"
-#     save_dir.mkdir(parents=True, exist_ok=True)
-
-#     successes, fitnesses, all_metrics = 0, [], []
-#     env = CarlaTown01Env(policy_path=policy_path, ...)
-#     for ep in range(n_episodes):
-#         success, fit, metrics = env.run_episode()
-#         metrics = clean_metrics(metrics, 2)
-#         successes += int(success)
-#         fitnesses.append(fit)
-#         all_metrics.append(metrics)
-#         env.cleanup()
-
-#     avg_fitness = float(np.mean(fitnesses)) if fitnesses else 0.0
-#     results = {
-#         "avg_fitness": avg_fitness,
-#         "episodes": n_episodes,
-#         "metrics_per_episode": merge_metrics(all_metrics)
-#     }
-
-#     with open(save_dir / "fitness.txt", "w") as f:
-#         f.write(f"{avg_fitness:.4f}\n")
-
-#     with open(save_dir / "metrics.json", "w") as f:
-#         json.dump(results["metrics_per_episode"], f, indent=2)
-
-#     return avg_fitness, results["metrics_per_episode"]
 
 
 
 
-# if __name__ == "__main__":
-#     import os, glob
-
-#     policy_dir = "/home/alkis/Downloads/carla/python_code/Revolve/agent/policies"
-#     result_dir = "/home/alkis/Downloads/carla/python_code/Revolve/agent/results"
-
-#     policies = sorted(glob.glob(os.path.join(policy_dir, "policy_*.txt")))
-
-#     for p in policies:
-#         if p.endswith("_raw.txt"):
-#             continue
-
-#         fname = os.path.splitext(os.path.basename(p))[0]  # e.g. policy_8
-#         result_path = os.path.join(result_dir, fname)
-
-#         if os.path.exists(result_path):
-#             print(f"Skipping {fname} (already has results)")
-#             continue
-
-#         print(f"Running {fname}")
-#         main(p, episodes=10)
-# if __name__ == "__main__":
-#     import os, glob
-
-#     policy_dir = "/home/alkis/Downloads/carla/python_code/Revolve/agent/policies"
-#     result_dir = "/home/alkis/Downloads/carla/python_code/Revolve/agent/results"
-
-#     # rerun only the failed policies from errors.log
-#     wanted = ["policy_0.txt","policy_1.txt",
-#         "policy_2.txt", "policy_3.txt", "policy_4.txt", "policy_5.txt",
-#         "policy_6.txt", "policy_7.txt", "policy_8.txt", "policy_9.txt",
-#         "policy_11.txt", "policy_12.txt", "policy_13.txt",
-#         "policy_14.txt", "policy_15.txt"
-#     ]
-
-#     policies = [os.path.join(policy_dir, f) for f in wanted if os.path.exists(os.path.join(policy_dir, f))]
-
-#     for p in policies:
-#         fname = os.path.splitext(os.path.basename(p))[0]  # e.g. policy_11
-#         result_json = os.path.join(result_dir, f"0_{fname.split('_')[1]}.json")
-
-#         # skip if proper JSON already exists (avoid rerun)
-#         if os.path.exists(result_json):
-#             print(f"Skipping {fname} (already has results)")
-#             continue
-
-#         print(f"Running {fname}")
-#         res = run_main(p, episodes=10)
-#         json_fp, txt_fp = save_policy_summary_temp(p, res, result_dir)
-#         print(f"Saved {json_fp} and {txt_fp}")
-# if __name__ == "__main__":
-#     import argparse, os
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument("--policy", required=True)
-#     args = parser.parse_args()
-
-#    # episodes = int(os.environ.get("EPISODES", 15))
-#     res = run_main(args.policy, episodes=12)
-#     json_fp, txt_fp = save_policy_summary_temp(args.policy, res, result_dir="results")
-#     print(f"[DONE] {args.policy} | saved {json_fp} | fitness={res['fitness']:.3f}")
 
