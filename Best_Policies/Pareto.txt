@@ -1,0 +1,299 @@
+import math
+import numpy as np
+
+class Policy:
+    def __init__(self):
+        # Configurable parameters (deterministic constants)
+        self.v_cruise = 6.94  # m/s (~25 km/h)
+        # Lateral control gains (right-positive conventions)
+        self.k_yaw = 0.85      # rad -> normalized steer
+        self.k_lat = 0.18      # m -> normalized steer
+        self.k_yawr = 0.12     # yaw-rate damping
+        
+        # Command rate limits per control step
+        self.max_dsteer = 0.20
+        self.max_dthrottle = 0.10
+        self.max_dbrake = 0.20
+        
+        # Longitudinal control
+        self.k_throttle = 0.35
+        self.k_brake = 0.60
+        self.brake_hold = 0.25
+        self.creep_throttle = 0.12  # assist at very low speed when moving
+        
+        # Following (ACC-like)
+        self.min_gap_m = 3.0
+        self.time_headway_s = 1.5
+        
+        # Comfortable stopping profile
+        self.a_comf = 2.0  # m/s^2
+        
+        # Safety margins
+        self.light_margin_m = 2.5
+        self.ped_inlane_margin_m = 3.0
+        self.ped_approach_margin_m = 4.0
+        self.ped_yield_time_s = 3.0
+        
+        # Stuck/creep logic for stopped lead
+        self.stuck_steps = 0
+        self.stuck_steps_threshold = 80  # ~8 s at 10 Hz assumption
+        self.nudge_speed = 1.0  # m/s
+        self.no_oncoming_dist_m = 15.0
+        
+        # Last commands (for internal continuity if histories missing)
+        self.last_steer = 0.0
+        self.last_throttle = 0.0
+        self.last_brake = 0.0
+
+    # -------------------- Helpers --------------------
+    def _is_num(self, x):
+        try:
+            return x is not None and not (isinstance(x, float) and math.isnan(x))
+        except Exception:
+            return False
+
+    def _last_finite(self, arr, default=0.0):
+        if arr is None:
+            return default
+        try:
+            for x in reversed(arr):
+                if self._is_num(x):
+                    return float(x)
+        except Exception:
+            pass
+        return default
+
+    def _clip(self, x, lo, hi):
+        return max(lo, min(hi, x))
+
+    def _rate_limit(self, prev, target, max_delta):
+        if not self._is_num(prev):
+            prev = 0.0
+        delta = self._clip(target - prev, -max_delta, max_delta)
+        return prev + delta
+
+    def _safe_list(self, lst):
+        return lst if isinstance(lst, list) else []
+
+    def _safe_dict(self, dct):
+        return dct if isinstance(dct, dict) else {}
+
+    # -------------------- Core compute --------------------
+    def compute_action(self, obs, path):
+        # Fail-safe default
+        steer_cmd = self._rate_limit(self.last_steer, 0.0, self.max_dsteer)
+        throttle_cmd = self._rate_limit(self.last_throttle, 0.0, self.max_dthrottle)
+        brake_cmd = self._rate_limit(self.last_brake, 0.3, self.max_dbrake)
+
+        # Basic validation
+        if not isinstance(obs, dict):
+            self.last_steer, self.last_throttle, self.last_brake = steer_cmd, 0.0, brake_cmd
+            return float(steer_cmd), 0.0, float(brake_cmd)
+
+        # Extract ego states
+        v_ego = obs.get("speed_mps", 0.0)
+        if not self._is_num(v_ego):
+            v_ego = self._last_finite(obs.get("speed_hist4", []), 0.0)
+        yawr = obs.get("yaw_rate_rps", 0.0)
+        if not self._is_num(yawr):
+            yawr = 0.0
+
+        # Histories for smoothing/rate-limiting
+        steer_prev = self._last_finite(obs.get("steer_cmd_hist4", []), self.last_steer)
+        throttle_prev = self._last_finite(obs.get("throttle_cmd_hist4", []), self.last_throttle)
+        brake_prev = self._last_finite(obs.get("brake_cmd_hist4", []), self.last_brake)
+
+        # Lateral control inputs (right-positive)
+        lat_e = self._last_finite(obs.get("lateral_hist4", []), 0.0)
+        yaw_e = self._last_finite(obs.get("yaw_error_hist4", []), 0.0)
+
+        # Lateral control: steer right-positive; errors right-positive -> steer left to correct
+        steer_des = -(self.k_yaw * yaw_e + self.k_lat * lat_e + self.k_yawr * yawr)
+        steer_des = self._clip(steer_des, -1.0, 1.0)
+        steer_cmd = self._rate_limit(steer_prev, steer_des, self.max_dsteer)
+
+        # Hazard assessment
+        v_cruise = self.v_cruise
+        hazards_dists = []  # effective stopping distances (meters ahead)
+        must_stop_hard = False
+
+        # Traffic light: treat Unknown as Red (safer)
+        tl = self._safe_dict(obs.get("traffic_light"))
+        if tl.get("exists", False):
+            state = tl.get("state", "Unknown")
+            dist = tl.get("dist_m", None)
+            if self._is_num(dist) and dist is not None and dist > 0:
+                if state == "Red" or state == "Unknown":
+                    d_eff = dist - self.light_margin_m
+                    if d_eff <= 0:
+                        d_eff = 0.0
+                    hazards_dists.append(d_eff)
+
+        # Pedestrians
+        for ped in self._safe_list(obs.get("pedestrians")):
+            ped = self._safe_dict(ped)
+            lane = ped.get("lane", "")
+            state = ped.get("state", "")
+            gap_long = ped.get("gap_long_m", None)
+            t_enter = ped.get("t_enter_lane_s", None)
+
+            if not (self._is_num(gap_long) and gap_long is not None and gap_long > 0):
+                continue
+
+            # If already in ego lane: stop with margin
+            if lane == "ego" and state == "in_lane":
+                d_eff = gap_long - self.ped_inlane_margin_m
+                hazards_dists.append(max(0.0, d_eff))
+                must_stop_hard = True
+                continue
+
+            # Approaching lane: yield if predicted to enter soon
+            if lane == "approach" and state == "approaching_lane":
+                if self._is_num(t_enter) and t_enter is not None and t_enter <= self.ped_yield_time_s:
+                    d_eff = gap_long - self.ped_approach_margin_m
+                    hazards_dists.append(max(0.0, d_eff))
+
+        # Lead vehicle following (ACC-like cap) with conservative TTC/THW and always add dynamic hazard buffer
+        v_cap_acc = None
+        lead_list = self._safe_list(obs.get("lead_cars"))
+        if lead_list:
+            lead = self._safe_dict(lead_list[0])
+            d = lead.get("gap_long_m", None)
+            rel_long_mps = lead.get("rel_long_mps", None)
+            thw_s = lead.get("thw_s", None)
+            ttc = lead.get("ttc_s", None)
+            v_lead = None
+            if self._is_num(d) and d is not None and d > 0:
+                if self._is_num(rel_long_mps):
+                    v_lead = v_ego + rel_long_mps
+
+                # Dynamic buffer increases with speed for safer car-following
+                d_buf = self.min_gap_m + 0.5 * max(v_ego, 0.0)
+
+                # ACC speed cap based on available gap and dynamic buffer
+                if d > d_buf:
+                    v_cap = (d - d_buf) / max(self.time_headway_s, 0.1)
+                    if v_lead is not None:
+                        # Do not exceed lead speed (slight allowance)
+                        v_cap = min(v_cap, max(v_lead - 0.1, 0.0))
+                    v_cap_acc = max(0.0, min(v_cap, v_cruise))
+                else:
+                    v_cap_acc = 0.0
+
+                # Hazard distance logic: brake earlier when closing or headway is short
+                closing = self._is_num(rel_long_mps) and rel_long_mps < 0.0
+                short_ttc = self._is_num(ttc) and ttc is not None and ttc < 3.0
+                short_thw = self._is_num(thw_s) and thw_s is not None and thw_s < self.time_headway_s
+                if closing or short_ttc or short_thw:
+                    hazards_dists.append(max(0.0, d - d_buf))
+
+                # Always treat the lead vehicle as a potential stopping hazard using a dynamic margin (from other parent)
+                dynamic_margin = max(self.min_gap_m, 0.5 * max(0.0, v_ego) + 2.0)
+                hazards_dists.append(max(0.0, d - dynamic_margin))
+
+                # Hard-stop bias if very close and closing fast
+                if closing and self._is_num(rel_long_mps) and rel_long_mps < -0.5 and d < max(4.0, d_buf):
+                    hazards_dists.append(max(0.0, d - d_buf))
+                    must_stop_hard = True
+
+                # Stuck detection (lead stopped ahead for long)
+                lead_speed_est = v_lead if v_lead is not None else None
+                if lead_speed_est is not None and abs(lead_speed_est) < 0.2 and d < 15.0:
+                    self.stuck_steps += 1
+                else:
+                    self.stuck_steps = 0
+            else:
+                self.stuck_steps = 0
+        else:
+            self.stuck_steps = 0
+
+        # Oncoming traffic presence for nudge safety
+        oncoming_safe = True
+        opp = self._safe_list(obs.get("opposite_cars"))
+        if opp:
+            oc = self._safe_dict(opp[0])
+            ogap = oc.get("gap_long_m", None)
+            if self._is_num(ogap) and ogap is not None and ogap < self.no_oncoming_dist_m:
+                oncoming_safe = False
+
+        # Compute speed cap from hazard stopping distance (comfortable-stop envelope)
+        v_cap_stop = None
+        if len(hazards_dists) > 0:
+            d_min = min(hazards_dists)
+            if d_min <= 0.0:
+                v_cap_stop = 0.0
+            else:
+                v_cap_stop = math.sqrt(max(0.0, 2.0 * self.a_comf * d_min))
+
+        # Adaptive free-flow cruise boost from other parent
+        v_cruise_eff = v_cruise
+        tl_state = tl.get("state", "Unknown")
+        tl_exists = tl.get("exists", False)
+        scene_clear = (len(hazards_dists) == 0) and (not lead_list) and (len(self._safe_list(obs.get("pedestrians"))) == 0)
+        tl_clear = (not tl_exists) or (tl_state == "Green")
+        tracking_stable = (abs(lat_e) < 0.5 and abs(yaw_e) < 0.2 and abs(yawr) < 0.5)
+        if scene_clear and tl_clear and tracking_stable:
+            v_cruise_eff = max(v_cruise, 8.33)
+
+        # Combine speed targets
+        v_target_candidates = [v_cruise_eff]
+        if v_cap_acc is not None:
+            v_target_candidates.append(v_cap_acc)
+        if v_cap_stop is not None:
+            v_target_candidates.append(v_cap_stop)
+
+        # Nudge logic: if stuck behind a stopped lead for long and no oncoming, allow slow crawl
+        if self.stuck_steps > self.stuck_steps_threshold and oncoming_safe:
+            v_target_candidates.append(self.nudge_speed)
+
+        v_target = min(v_target_candidates) if v_target_candidates else 0.0
+        v_target = max(0.0, v_target)
+
+        # Longitudinal control (separate throttle/brake, never both)
+        v_err = v_target - max(0.0, v_ego)
+
+        throttle_des = 0.0
+        brake_des = 0.0
+
+        # If must stop hard (e.g., pedestrian in lane very close), bias towards braking
+        if v_target <= 0.01 and (len(hazards_dists) > 0 or must_stop_hard):
+            if v_ego > 0.1:
+                brake_des = self._clip(self.k_brake * (v_ego - v_target), 0.0, 1.0)
+            else:
+                brake_des = max(self.brake_hold, brake_prev)  # hold at stop
+        else:
+            if v_err > 0.1:
+                throttle_des = self._clip(self.k_throttle * v_err, 0.0, 1.0)
+                if v_ego < 0.3 and v_target > 0.1:
+                    throttle_des = max(throttle_des, self.creep_throttle)
+                brake_des = 0.0
+            elif v_err < -0.05:
+                brake_des = self._clip(self.k_brake * (-v_err), 0.0, 1.0)
+                throttle_des = 0.0
+            else:
+                throttle_des = 0.0
+                brake_des = 0.0
+
+        # Standing hold if hazard requires stopping and essentially at stop line
+        if v_target <= 0.01 and v_ego < 0.1 and len(hazards_dists) > 0:
+            brake_des = max(brake_des, self.brake_hold)
+            throttle_des = 0.0
+
+        # Rate-limit and enforce mutual exclusion
+        throttle_cmd = self._rate_limit(throttle_prev, self._clip(throttle_des, 0.0, 1.0), self.max_dthrottle)
+        brake_cmd = self._rate_limit(brake_prev, self._clip(brake_des, 0.0, 1.0), self.max_dbrake)
+
+        if brake_cmd > 0.0:
+            throttle_cmd = 0.0
+
+        # Clip final commands to bounds
+        steer_cmd = self._clip(steer_cmd, -1.0, 1.0)
+        throttle_cmd = self._clip(throttle_cmd, 0.0, 1.0)
+        brake_cmd = self._clip(brake_cmd, 0.0, 1.0)
+
+        # Update last commands for continuity
+        self.last_steer = steer_cmd
+        self.last_throttle = throttle_cmd
+        self.last_brake = brake_cmd
+
+        return float(steer_cmd), float(throttle_cmd), float(brake_cmd)

@@ -1,0 +1,338 @@
+import math
+
+class Policy:
+    def __init__(self):
+        # Controller parameters
+        # Lateral control gains (right-positive -> steer right; we use negative to correct toward lane center)
+        self.k_y = 0.25       # cross-track proportional
+        self.k_psi = 0.85     # heading error proportional
+        self.k_dpsi = 0.12    # yaw rate damping
+
+        # Rate limits per control step
+        self.steer_rate = 0.12
+        self.throttle_rate = 0.08
+        self.brake_rate = 0.15
+
+        # Speed targets and acceleration limits
+        self.v_cruise = 6.94  # 25 km/h
+        self.a_max_throttle = 2.0  # m/s^2 corresponding to throttle=1
+        self.a_max_brake = 3.5     # m/s^2 corresponding to brake=1
+        self.kp_accel = 0.6
+        self.kp_brake = 1.2
+
+        # Comfort and safety
+        self.a_comf = 2.0
+        self.stop_margin_red = 3.0
+        self.stop_margin_lead = 3.0
+        self.ped_margin = 2.0
+        self.ped_enter_time_s = 3.0
+        self.headway_s = 1.5
+
+        # Curvature/instability speed caps
+        self.yaw_err_slow1 = 0.35
+        self.yaw_err_slow2 = 0.6
+        self.lat_err_slow1 = 1.0
+        self.lat_err_slow2 = 1.8
+
+        # Creep state for blocked-by-lead
+        self.dt = 0.1
+        self.blocked_timer_s = 0.0
+        self.creep_active = False
+
+        # Last command cache (fallback if histories invalid)
+        self.prev_steer = 0.0
+        self.prev_throttle = 0.0
+        self.prev_brake = 0.0
+
+        # Last speed cache (for fail-safe)
+        self.last_speed = 0.0
+
+    def compute_action(self, obs, path):
+        # Helper functions
+        def isnumeric(x):
+            return isinstance(x, (int, float)) and not (isinstance(x, float) and math.isnan(x))
+
+        def last_valid(arr, default=0.0):
+            try:
+                if arr is None:
+                    return default
+                if len(arr) == 0:
+                    return default
+                val = arr[-1]
+                return val if isnumeric(val) else default
+            except Exception:
+                return default
+
+        def clamp(x, lo, hi):
+            return max(lo, min(hi, x))
+
+        def rate_limit(cmd_des, cmd_prev, rate, lo, hi):
+            if not isnumeric(cmd_prev):
+                cmd_prev = 0.0
+            delta = clamp(cmd_des - cmd_prev, -rate, rate)
+            return clamp(cmd_prev + delta, lo, hi)
+
+        # Extract and sanitize observation
+        speed = obs.get("speed_mps", 0.0)
+        if not isnumeric(speed):
+            speed = self.last_speed
+        self.last_speed = speed
+
+        yaw_rate = obs.get("yaw_rate_rps", 0.0)
+        yaw_rate = yaw_rate if isnumeric(yaw_rate) else 0.0
+
+        lateral_hist4 = obs.get("lateral_hist4", [0.0, 0.0, 0.0, 0.0]) or [0.0, 0.0, 0.0, 0.0]
+        yaw_error_hist4 = obs.get("yaw_error_hist4", [0.0, 0.0, 0.0, 0.0]) or [0.0, 0.0, 0.0, 0.0]
+
+        e_y = last_valid(lateral_hist4, 0.0)            # right-positive meters
+        e_psi = last_valid(yaw_error_hist4, 0.0)        # right-positive radians
+
+        steer_prev_obs = last_valid(obs.get("steer_cmd_hist4", [self.prev_steer]), self.prev_steer)
+        throttle_prev_obs = last_valid(obs.get("throttle_cmd_hist4", [self.prev_throttle]), self.prev_throttle)
+        brake_prev_obs = last_valid(obs.get("brake_cmd_hist4", [self.prev_brake]), self.prev_brake)
+
+        # Traffic light
+        tlight = obs.get("traffic_light", {}) or {}
+        tl_exists = bool(tlight.get("exists", False))
+        tl_state = tlight.get("state", "Unknown")
+        tl_dist = tlight.get("dist_m", None)
+        tl_dist = tl_dist if isnumeric(tl_dist) else None
+
+        # Vehicles and pedestrians
+        lead_cars = obs.get("lead_cars", []) or []
+        opposite_cars = obs.get("opposite_cars", []) or []
+        pedestrians = obs.get("pedestrians", []) or []
+
+        # Fail-safe on severely invalid data
+        critical_ok = isinstance(lead_cars, list) and isinstance(pedestrians, list) and isinstance(opposite_cars, list)
+        if not isnumeric(speed):
+            critical_ok = False
+        if not critical_ok:
+            # Controlled stop with neutral steering tendency
+            steer_des = 0.0
+            steer_cmd = rate_limit(steer_des, steer_prev_obs, self.steer_rate, -1.0, 1.0)
+            throttle_cmd = 0.0
+            brake_cmd = rate_limit(0.4, brake_prev_obs, self.brake_rate, 0.0, 1.0)
+            self.prev_steer, self.prev_throttle, self.prev_brake = steer_cmd, throttle_cmd, brake_cmd
+            return steer_cmd, throttle_cmd, brake_cmd
+
+        # Lateral control (right-positive)
+        # If car is right of center (+e_y), steer left (negative)
+        steer_raw = -self.k_y * e_y - self.k_psi * e_psi - self.k_dpsi * yaw_rate
+        steer_raw = clamp(steer_raw, -1.0, 1.0)
+        steer_cmd = rate_limit(steer_raw, steer_prev_obs, self.steer_rate, -1.0, 1.0)
+
+        # Longitudinal speed capping logic
+        v_cap = self.v_cruise
+
+        # Slow down for large heading/lateral errors
+        if abs(e_psi) > self.yaw_err_slow1 or abs(e_y) > self.lat_err_slow1:
+            v_cap = min(v_cap, 5.0)
+        if abs(e_psi) > self.yaw_err_slow2 or abs(e_y) > self.lat_err_slow2:
+            v_cap = min(v_cap, 3.0)
+
+        # Traffic light handling
+        red_active = False
+        if tl_exists:
+            if tl_state == "Red":
+                red_active = True
+                if tl_dist is None:
+                    # No reliable distance; conservative stop
+                    v_cap = 0.0
+                else:
+                    d = tl_dist - self.stop_margin_red
+                    if d <= 0.0:
+                        v_cap = 0.0
+                    else:
+                        v_allow = math.sqrt(max(0.0, 2.0 * self.a_comf * d))
+                        v_cap = min(v_cap, v_allow)
+            elif tl_state == "Unknown":
+                # Cautious: if very close to an active gate, slow down
+                if tl_dist is not None and tl_dist < 8.0:
+                    d = max(0.0, tl_dist - self.stop_margin_red)
+                    v_allow = math.sqrt(max(0.0, 2.0 * (0.75 * self.a_comf) * d))
+                    v_cap = min(v_cap, v_allow)
+
+        # Pedestrian yielding (merge: enhanced lateral-aware logic + time-to-arrival stop condition)
+        ped_active = False
+        if isinstance(pedestrians, list):
+            for ped in pedestrians:
+                try:
+                    lane = ped.get("lane", "")
+                    state = ped.get("state", "")
+                    gap_long = ped.get("gap_long_m", None)
+                    gap_lat = ped.get("gap_lat_m", None)
+                    t_enter = ped.get("t_enter_lane_s", None)
+                    rel_lat = ped.get("rel_lat_mps", None)
+
+                    if not isnumeric(gap_long) or gap_long is None or gap_long <= 0.0:
+                        continue
+
+                    # Lateral hazard envelope (meters, ego frame: y right-positive)
+                    lat = gap_lat if isnumeric(gap_lat) else 0.0
+                    lateral_envelope = 2.5  # treat +/- 2.5 m around ego path as potential conflict
+                    lateral_hazard = abs(lat) <= lateral_envelope
+
+                    # Comfortable stop speed for distance to pedestrian with margin
+                    d_stop = max(0.0, gap_long - max(2.5, self.ped_margin))
+                    v_allow_stop = math.sqrt(max(0.0, 2.0 * (0.9 * self.a_comf) * d_stop))
+
+                    # Time for ego to reach the pedestrian's longitudinal position
+                    # Use conservative ETA from parent A
+                    ego_speed_for_eta = max(0.3, speed)
+                    t_arrive = gap_long / ego_speed_for_eta
+
+                    # Determine if entering is predicted (time-based or lateral motion towards lane center)
+                    predicted_enter = (isnumeric(t_enter) and t_enter is not None and 0.0 <= t_enter <= (self.ped_enter_time_s + 1.0))
+                    lateral_toward_lane = (isnumeric(rel_lat) and isnumeric(lat) and abs(rel_lat) > 0.05 and (rel_lat * lat) < 0.0)
+                    lateral_cue = (not predicted_enter) and lateral_toward_lane and gap_long < 25.0
+
+                    # Emergency stop conditions (very close conflicts)
+                    imminent_time = (predicted_enter and (isnumeric(t_enter) and t_enter < 1.0)) or (lateral_cue and abs(lat) < 1.5)
+                    if (lane == "ego" and state == "in_lane" and gap_long < 15.0 and lateral_hazard) or \
+                       ((lane == "approach" and state == "approaching_lane") and gap_long < 10.0 and imminent_time):
+                        ped_active = True
+                        v_cap = min(v_cap, 0.0)
+                        continue
+
+                    # In-lane pedestrian: plan to stop with strong lateral check
+                    if lane == "ego" and state == "in_lane":
+                        ped_active = True
+                        if lateral_hazard:
+                            # Additional near-field cap from parent A to avoid creeping in very close range
+                            if d_stop < 6.0:
+                                v_allow_stop = min(v_allow_stop, 0.5)
+                            # Ensure arrival is not too soon; time-gap shaping
+                            v_time_gap = gap_long / max(2.0, 0.5)
+                            v_cap = min(v_cap, v_allow_stop, v_time_gap)
+                        else:
+                            v_cap = min(v_cap, v_allow_stop)
+                        continue
+
+                    # Approaching pedestrian: ensure we arrive after they clear the lane with buffer
+                    if lane == "approach" and state == "approaching_lane":
+                        if predicted_enter or lateral_cue:
+                            ped_active = True
+                            # Hard stop condition from parent A when our arrival conflicts with their entry timing
+                            if predicted_enter and (t_arrive <= (t_enter + 1.0)):
+                                v_cap = min(v_cap, 0.0)
+                            else:
+                                buffer_s = 1.5
+                                if predicted_enter:
+                                    denom = max(t_enter + buffer_s, 0.5)
+                                    v_time_gap = gap_long / denom
+                                    v_cap = min(v_cap, v_time_gap)
+                                else:
+                                    v_cap = min(v_cap, gap_long / 3.0)
+                            # Always ensure ability to stop comfortably before the pedestrian
+                            v_cap = min(v_cap, v_allow_stop)
+                except Exception:
+                    continue
+
+        # Lead vehicle following
+        lead_active = False
+        lead_gap = None
+        lead_speed_est = None
+        if isinstance(lead_cars, list) and len(lead_cars) > 0:
+            lead = lead_cars[0]
+            gap = lead.get("gap_long_m", None)
+            rel = lead.get("rel_long_mps", None)
+            thw = lead.get("thw_s", None)
+            ttc = lead.get("ttc_s", None)
+            if isnumeric(gap) and gap > 0.0:
+                lead_gap = gap
+                v_lead_est = speed + (rel if isnumeric(rel) else 0.0)
+                v_lead_est = max(0.0, v_lead_est)
+                lead_speed_est = v_lead_est
+                v_cap_thw = gap / self.headway_s
+                v_cap_lead = v_lead_est + 0.5
+                v_allow_stop = 1e6
+                # If lead near-stop and close, prepare to stop before margin
+                if v_lead_est < 0.2 and gap < 30.0:
+                    d = gap - self.stop_margin_lead
+                    d = max(0.0, d)
+                    v_allow_stop = math.sqrt(max(0.0, 2.0 * self.a_comf * d))
+                v_follow_cap = min(v_cap_thw, v_cap_lead, v_allow_stop)
+                # If closing fast (small TTC), be more restrictive
+                if isnumeric(ttc) and ttc is not None and ttc > 0.0 and ttc < 3.0:
+                    v_follow_cap = min(v_follow_cap, max(0.0, gap / (self.headway_s * 2.0)))
+                v_cap = min(v_cap, v_follow_cap)
+                lead_active = True
+
+        # Creep logic if blocked by stopped lead for extended time and safe wrt oncoming
+        creeping_allowed = False
+        if lead_active and lead_gap is not None and lead_speed_est is not None:
+            is_blocked_now = (lead_gap <= 10.0) and (lead_speed_est < 0.2) and (speed < 0.3)
+            # Only consider creep if not blocked by red light or pedestrians
+            if is_blocked_now and (not red_active) and (not ped_active):
+                self.blocked_timer_s += self.dt
+            else:
+                self.blocked_timer_s = 0.0
+                self.creep_active = False
+
+            if self.blocked_timer_s > 6.0:
+                # Check oncoming safety
+                oncoming_near = False
+                for oc in (opposite_cars or []):
+                    try:
+                        ogap = oc.get("gap_long_m", None)
+                        if isnumeric(ogap) and ogap >= 0.0 and ogap < 15.0:
+                            oncoming_near = True
+                            break
+                    except Exception:
+                        continue
+                if not oncoming_near:
+                    creeping_allowed = True
+                    self.creep_active = True
+
+        if self.creep_active and creeping_allowed:
+            v_cap = min(v_cap, 1.0)  # gentle creep
+        else:
+            self.creep_active = False
+
+        # Ensure non-negative target
+        v_target = max(0.0, v_cap)
+
+        # Speed control -> throttle/brake
+        v_err = v_target - speed
+
+        throttle_des = 0.0
+        brake_des = 0.0
+        if v_err >= 0.05:
+            a_cmd = min(self.kp_accel * v_err, self.a_max_throttle)
+            throttle_des = clamp(a_cmd / self.a_max_throttle, 0.0, 1.0)
+            brake_des = 0.0
+        elif v_err <= -0.05:
+            decel = min(self.kp_brake * (-v_err), self.a_max_brake)
+            brake_des = clamp(decel / self.a_max_brake, 0.0, 1.0)
+            throttle_des = 0.0
+        else:
+            # Small band around zero error: coast
+            throttle_des = 0.0
+            brake_des = 0.0
+
+        # Standstill hold if we're supposed to stop
+        if v_target < 0.2 and speed < 0.3:
+            brake_des = max(brake_des, 0.2)
+            throttle_des = 0.0
+
+        # Rate limit and mutual-exclusion handling
+        # Prioritize braking over throttle
+        brake_cmd_rl = rate_limit(brake_des, brake_prev_obs, self.brake_rate, 0.0, 1.0)
+        if brake_cmd_rl > 0.01:
+            throttle_cmd_rl = 0.0
+        else:
+            throttle_cmd_rl = rate_limit(throttle_des, throttle_prev_obs, self.throttle_rate, 0.0, 1.0)
+            # Ensure no overlap
+            if throttle_cmd_rl > 0.0:
+                brake_cmd_rl = 0.0
+
+        # Final commands
+        steer_cmd = clamp(steer_cmd, -1.0, 1.0)
+        throttle_cmd = clamp(throttle_cmd_rl, 0.0, 1.0)
+        brake_cmd = clamp(brake_cmd_rl, 0.0, 1.0)
+
+        # Cache
+        self.prev_steer, self.prev_throttle, self.prev_brake = steer_cmd, throttle_cmd, brake_cmd
+
+        return steer_cmd, throttle_cmd, brake_cmd
